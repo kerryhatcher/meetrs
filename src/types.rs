@@ -100,6 +100,42 @@ pub enum Status {
     Warning(String),
     /// Recording has stopped and all files are flushed.
     Finished { total_chunks: u32, total: Duration },
+
+    /// Transcription of a chunk began.
+    TranscribeStarted { index: u32 },
+    /// Transcription finished. `took` vs the chunk's audio duration is the
+    /// realtime factor, which is what tells you whether transcription can keep
+    /// up with recording.
+    TranscribeDone {
+        index: u32,
+        took: Duration,
+        audio: Duration,
+        words: usize,
+    },
+    /// Transcription failed for one chunk. Never fatal — the audio is already
+    /// safely on disk, which is the guarantee that matters.
+    TranscribeFailed { index: u32, err: String },
+    /// Chunks closed but not yet transcribed. Non-zero and growing means
+    /// transcription is falling behind recording.
+    TranscribeBacklog { pending: usize },
+}
+
+/// A closed chunk handed to the transcription worker. Sent as soon as the chunk
+/// is fsynced, so transcription of chunk 0 overlaps recording of chunk 1.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub path: PathBuf,
+    pub index: u32,
+    /// Offset of this chunk from session start, so transcript timestamps can be
+    /// made session-relative rather than chunk-relative.
+    pub offset: Duration,
+}
+
+/// Where the Whisper model is cached: `~/.meetrs/models/`.
+pub fn models_dir() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate ~/.meetrs"))?;
+    Ok(PathBuf::from(home).join(".meetrs").join("models"))
 }
 
 /// Where a session's files live: `~/.meetrs/recordings/<rfc3339-ish timestamp>/`.

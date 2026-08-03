@@ -109,6 +109,11 @@ struct App {
     warnings: u32,
     last_warning: Option<String>,
     finished: bool,
+    /// Index of the chunk currently being transcribed, if any.
+    transcribing: Option<u32>,
+    /// Chunks closed but not yet transcribed. Growing means falling behind.
+    backlog: usize,
+    transcribed: VecDeque<String>,
 }
 
 impl App {
@@ -127,6 +132,9 @@ impl App {
             warnings: 0,
             last_warning: None,
             finished: false,
+            transcribing: None,
+            backlog: 0,
+            transcribed: VecDeque::with_capacity(CHUNK_HISTORY),
         }
     }
 
@@ -177,6 +185,34 @@ impl App {
                 self.last_warning = Some(msg);
             }
             Status::Finished { .. } => self.finished = true,
+            Status::TranscribeStarted { index } => self.transcribing = Some(index),
+            Status::TranscribeDone {
+                index,
+                took,
+                audio,
+                words,
+            } => {
+                self.transcribing = None;
+                // The realtime factor is the number that matters: below 1.0x and
+                // transcription can never catch up with recording.
+                let xrt = if took.as_secs_f32() > 0.0 {
+                    audio.as_secs_f32() / took.as_secs_f32()
+                } else {
+                    0.0
+                };
+                self.transcribed.push_front(format!(
+                    "chunk-{index:03} {words} words  {xrt:.0}x realtime"
+                ));
+                while self.transcribed.len() > CHUNK_HISTORY {
+                    self.transcribed.pop_back();
+                }
+            }
+            Status::TranscribeFailed { index, err } => {
+                self.transcribing = None;
+                self.warnings += 1;
+                self.last_warning = Some(format!("transcribe chunk-{index:03} failed: {err}"));
+            }
+            Status::TranscribeBacklog { pending } => self.backlog = pending,
         }
     }
 }
@@ -336,6 +372,23 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled("● listening", Style::default().fg(Color::Green))
     };
     let chunk_elapsed = app.current_started.elapsed();
+    let asr = match (app.transcribing, app.backlog) {
+        (Some(i), 0) => Span::styled(
+            format!("   ⠿ transcribing #{i}"),
+            Style::default().fg(Color::Cyan),
+        ),
+        // A growing backlog is the signal that transcription cannot keep up,
+        // so show it in yellow rather than burying it.
+        (Some(i), n) => Span::styled(
+            format!("   ⠿ transcribing #{i} (+{n} queued)"),
+            Style::default().fg(Color::Yellow),
+        ),
+        (None, 0) => Span::styled("   transcribe idle", Style::default().fg(Color::DarkGray)),
+        (None, n) => Span::styled(
+            format!("   {n} queued to transcribe"),
+            Style::default().fg(Color::Yellow),
+        ),
+    };
     let line = Line::from(vec![
         listening,
         Span::raw(format!(
@@ -343,6 +396,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             app.current_index,
             chunk_elapsed.as_secs_f32()
         )),
+        asr,
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -369,10 +423,16 @@ fn draw_chunks(frame: &mut Frame, area: Rect, app: &App) {
             ))
         })
         .collect();
+    let mut items = items;
+    for t in app.transcribed.iter() {
+        items.push(ListItem::new(format!(
+            "  ↳ {t}"
+        )));
+    }
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("chunks (newest first)"),
+            .title("chunks · transcripts (newest first)"),
     );
     frame.render_widget(list, area);
 }

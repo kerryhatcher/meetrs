@@ -7,6 +7,8 @@
 mod capture;
 mod chunk;
 mod lock;
+mod model;
+mod transcribe;
 mod types;
 mod ui;
 mod vad;
@@ -27,6 +29,12 @@ fn main() -> Result<()> {
     // `--check` too — it opens capture as well.
     let _lock = lock::acquire()?;
 
+    // whisper.cpp and ggml log to stderr by default, which would scribble over
+    // the TUI's alternate screen. This reroutes them into the `log` crate, and
+    // since no `log` backend is enabled they go nowhere. Must happen before any
+    // WhisperContext is created.
+    whisper_rs::install_logging_hooks();
+
     if std::env::args().any(|a| a == "--check") {
         return check();
     }
@@ -37,21 +45,49 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating session dir {}", dir.display()))?;
 
+    // Fetch the model before the TUI takes the screen, so first-run download
+    // progress is plain readable stdout rather than fighting the alternate
+    // screen. Steady state is a checksum check and no network at all.
+    let model = model::ensure(|done, total| {
+        match done.saturating_mul(100).checked_div(total) {
+            Some(pct) => eprint!("\rdownloading model… {pct}%"),
+            // total==0 means the server sent no Content-Length.
+            None => eprint!("\rdownloading model… {done} bytes"),
+        }
+    })
+    .context("obtaining a Whisper model")?;
+    eprintln!();
+
     let (info, consumer) = capture::start(RING_SAMPLES).context(
         "starting audio capture — if this is a permissions failure, see the README \
          section on TCC consent and codesigning",
     )?;
 
     let (tx, rx) = mpsc::channel();
+    // Chunks are queued here the moment they are fsynced, so transcription of
+    // chunk 0 overlaps recording of chunk 1 rather than waiting for the session
+    // to end.
+    let (jobs_tx, jobs_rx) = mpsc::channel();
     let stop = chunk::StopFlag::new();
+
+    // Both worker threads report to the same UI channel.
+    let asr_tx = tx.clone();
 
     let writer = {
         let dir = dir.clone();
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("meetrs-writer".into())
-            .spawn(move || chunk::run(consumer, info, dir, tx, stop))
+            .spawn(move || chunk::run(consumer, info, dir, tx, jobs_tx, stop))
             .context("spawning writer thread")?
+    };
+
+    let asr = {
+        let dir = dir.clone();
+        std::thread::Builder::new()
+            .name("meetrs-transcribe".into())
+            .spawn(move || transcribe::run(jobs_rx, model, dir, asr_tx))
+            .context("spawning transcribe thread")?
     };
 
     let outcome = ui::run(rx, &dir, info, &stop);
@@ -65,12 +101,23 @@ fn main() -> Result<()> {
     // Restore the terminal before reporting anything.
     outcome?;
     let summary = write_result?;
+
+    // The writer has dropped its jobs sender by now, so the transcriber will
+    // finish its queue and exit. Wait for it: the audio is already safe, but
+    // silently discarding queued transcription would be a surprise. Recording
+    // is the guarantee, transcription is best-effort — so a failure here is
+    // reported, not propagated.
     println!(
-        "{} chunk(s), {:.1}s total\n{}",
+        "{} chunk(s), {:.1}s total — finishing transcription…",
         summary.chunks,
-        summary.total.as_secs_f32(),
-        dir.display()
+        summary.total.as_secs_f32()
     );
+    match asr.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("transcription ended early: {e:#}"),
+        Err(_) => eprintln!("transcription thread panicked; audio is still intact"),
+    }
+    println!("{}", dir.display());
     Ok(())
 }
 

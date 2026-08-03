@@ -4,8 +4,8 @@ A terminal meeting recorder. Captures your microphone and your system audio into
 one synchronized stream, and writes WAV chunks split on natural pauses so a crash
 costs at most one chunk.
 
-**Recording only.** Transcription is deliberately out of scope — see
-[`docs/research/`](docs/research/) for the research backing what comes next.
+Transcription runs locally as recording proceeds — the first chunk starts
+transcribing while the second is still being recorded. Nothing leaves the machine.
 
 **Status: proof of concept.** macOS only. It does not delete or groom anything,
 so it will happily fill your disk.
@@ -55,8 +55,20 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
 ```
 ~/.meetrs/recordings/2026-08-03T16-04-22/
   chunk-000.wav      48kHz 32-bit float, mic + system interleaved
+  chunk-000.json     segments, session-relative times, per-leg labels
   chunk-001.wav
-  meta.json          channel map, threshold, per-chunk offsets
+  chunk-001.json
+  meta.json          channel map, detector, per-chunk offsets
+  transcript.md      speaker-labelled, human-readable
+```
+
+`transcript.md` looks like this — the mic and system legs are transcribed
+separately, which gives speaker attribution with no diarization model:
+
+```
+**[00:00:00] system:** The quick brown fox jumps over the lazy dog.
+
+**[00:00:09] system:** Meeting notes for the third of August about audio capture.
 ```
 
 Each chunk is closed and `fsync`ed before the next opens, so the only audio at

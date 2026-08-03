@@ -16,6 +16,16 @@ hound = "3.5.1"
 # For flock(2). Chosen over a PID file because the kernel releases a flock when
 # the process dies, even on SIGKILL — so there is no stale-lock case to handle.
 libc = "0.2.189"
+# Proper 48k->16k resampling for the ASR feed. The VAD gets away with a box
+# filter; aliasing in the transcription input would cost accuracy.
+rubato = "4.0.0"
+sha2 = "0.11.0"
+# whisper.cpp, compiled from vendored source into this binary. No dylib, no
+# external install. `metal` pulls in Apple's Metal + Accelerate frameworks.
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+# native-tls routes through Apple's Security.framework instead of vendoring
+# ring's C and assembly, which fits "Apple frameworks are fine" better.
+ureq = { version = "3.3.0", default-features = false, features = ["native-tls", "gzip"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 rtrb = "0.3.4"

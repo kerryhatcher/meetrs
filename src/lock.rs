@@ -1,5 +1,4 @@
 // ponytail: unused until main.rs wires this in — silence dead_code until then.
-#![allow(dead_code)]
 
 //! Single-instance guard via `flock(2)`.
 //!
@@ -20,7 +19,11 @@ use std::path::{Path, PathBuf};
 /// the process lifetime (e.g. `let _lock = lock::acquire()?;`), don't let it
 /// go out of scope before shutdown.
 #[must_use = "dropping this releases the single-instance lock"]
-pub struct InstanceLock(File);
+pub struct InstanceLock(
+    // Never read: the flock lives on this open file description, so holding the
+    // File *is* holding the lock, and closing it is what releases it.
+    #[allow(dead_code)] File,
+);
 
 /// Acquire the single-instance lock at `~/.meetrs/meetrs.lock`.
 pub fn acquire() -> Result<InstanceLock> {

@@ -4,9 +4,9 @@
 //!   pub struct StopFlag; impl StopFlag { fn new() -> Self; fn stop(&self); fn stopped(&self) -> bool; }
 //!   impl Clone for StopFlag
 //!   pub struct Summary { pub chunks: u32, pub total: std::time::Duration }
-//!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, stop: StopFlag) -> Result<Summary>
+//!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, jobs: mpsc::Sender<Job>, stop: StopFlag) -> Result<Summary>
 
-use crate::types::{CaptureInfo, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status};
+use crate::types::{CaptureInfo, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status};
 use crate::vad::Vad;
 use anyhow::Result;
 use serde::Serialize;
@@ -203,6 +203,7 @@ pub fn run(
     info: CaptureInfo,
     dir: PathBuf,
     tx: Sender<Status>,
+    jobs: Sender<Job>,
     stop: StopFlag,
 ) -> Result<Summary> {
     std::fs::create_dir_all(&dir)?;
@@ -399,7 +400,7 @@ pub fn run(
                     write_samples(&mut oc, &hold)?;
                 }
                 hold.clear();
-                finish_chunk(oc, &dir, &mut meta, &tx, &mut kept_chunks, &mut total)?;
+                finish_chunk(oc, &dir, &mut meta, &tx, &jobs, &mut kept_chunks, &mut total)?;
                 next_index += 1;
             }
             chunker.reset_after_cut();
@@ -419,7 +420,7 @@ pub fn run(
         if !hold.is_empty() {
             write_samples(&mut oc, &hold)?;
         }
-        finish_chunk(oc, &dir, &mut meta, &tx, &mut kept_chunks, &mut total)?;
+        finish_chunk(oc, &dir, &mut meta, &tx, &jobs, &mut kept_chunks, &mut total)?;
     }
 
     let _ = tx.send(Status::Finished {
@@ -455,6 +456,7 @@ fn finish_chunk(
     dir: &Path,
     meta: &mut Meta,
     tx: &Sender<Status>,
+    jobs: &Sender<Job>,
     kept_chunks: &mut u32,
     total: &mut Duration,
 ) -> Result<()> {
@@ -490,6 +492,14 @@ fn finish_chunk(
         started_offset_secs: started_offset.as_secs_f64(),
     });
     write_meta_atomic(dir, meta)?;
+
+    // Queue for transcription only after meta.json is on disk — the worker reads
+    // the channel map from it, so sending earlier would race.
+    let _ = jobs.send(Job {
+        path: path.clone(),
+        index,
+        offset: started_offset,
+    });
 
     let _ = tx.send(Status::ChunkClosed {
         path,

@@ -7,6 +7,7 @@
 //!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, stop: StopFlag) -> Result<Summary>
 
 use crate::types::{CaptureInfo, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status};
+use crate::vad::Vad;
 use anyhow::Result;
 use serde::Serialize;
 use std::fs::File;
@@ -45,10 +46,10 @@ enum Cut {
     HardCap,
 }
 
-/// Pure decision logic for when to open/close a chunk, driven by per-window RMS.
+/// Pure decision logic for when to open/close a chunk, driven by a per-window
+/// speech/no-speech decision (from the VAD, or the RMS-threshold fallback).
 /// No file I/O, no ring buffer — this is what the tests exercise directly.
 struct Chunker {
-    threshold: f32,
     silence_to_cut: Duration,
     max_chunk: Duration,
     /// Frames of continuous silence seen since the last non-silent frame.
@@ -67,9 +68,8 @@ struct Chunker {
 }
 
 impl Chunker {
-    fn new(sample_rate: u32, threshold: f32) -> Self {
+    fn new(sample_rate: u32) -> Self {
         Chunker {
-            threshold,
             silence_to_cut: SILENCE_TO_CUT,
             max_chunk: MAX_CHUNK,
             silence_frames: 0,
@@ -85,10 +85,10 @@ impl Chunker {
         Duration::from_secs_f64(frames as f64 / self.sample_rate as f64)
     }
 
-    /// Feed `frames` frames of combined RMS `rms`. Returns Some(Cut) when the
-    /// caller should close (and finalize) the current chunk.
-    fn feed(&mut self, rms: f32, frames: u64) -> Option<Cut> {
-        let silent = rms < self.threshold;
+    /// Feed `frames` frames' worth of a speech/no-speech decision. Returns
+    /// Some(Cut) when the caller should close (and finalize) the current chunk.
+    fn feed(&mut self, speech: bool, frames: u64) -> Option<Cut> {
+        let silent = !speech;
 
         if silent {
             self.silence_frames += frames;
@@ -152,7 +152,13 @@ struct Meta {
     channels: u16,
     system_channels: (u16, u16),
     mic_channels: (u16, u16),
+    /// Vestigial since the VAD took over chunking: kept populated for
+    /// compatibility with any reader that expects the field, but see
+    /// `detector` for what actually produced these chunks.
     silence_threshold_rms: f32,
+    /// Names what decided speech vs. silence for this session: the VAD, or
+    /// (only if it failed to initialize) the RMS-threshold fallback.
+    detector: String,
     chunks: Vec<MetaChunk>,
 }
 
@@ -201,8 +207,29 @@ pub fn run(
 ) -> Result<Summary> {
     std::fs::create_dir_all(&dir)?;
 
+    // Threshold is vestigial for chunking now (kept for the meta.json field and
+    // as the fallback gate below); the VAD drives the actual cut decision.
     let threshold = crate::types::silence_threshold();
     let started = chrono::Local::now();
+
+    // earshot's construction is pure computation (embedded model, no I/O), so
+    // it shouldn't fail — but losing a whole recording because a VAD wouldn't
+    // init would be far worse than degraded RMS-threshold chunking, so guard
+    // it anyway and fall back rather than aborting.
+    let mut vad = match std::panic::catch_unwind(Vad::new) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let _ = tx.send(Status::Warning(
+                "VAD failed to initialize; falling back to RMS-threshold chunking".into(),
+            ));
+            None
+        }
+    };
+    let detector_name = if vad.is_some() {
+        "earshot (16kHz mono, 256-sample frames, per-leg)".to_string()
+    } else {
+        "rms-threshold-fallback".to_string()
+    };
 
     let mut meta = Meta {
         started: started.to_rfc3339(),
@@ -211,11 +238,16 @@ pub fn run(
         system_channels: info.system_channels,
         mic_channels: info.mic_channels,
         silence_threshold_rms: threshold,
+        detector: detector_name,
         chunks: Vec::new(),
     };
     write_meta_atomic(&dir, &meta)?;
 
-    let mut chunker = Chunker::new(info.sample_rate, threshold);
+    let mut chunker = Chunker::new(info.sample_rate);
+    // Last known per-leg speech decision — carried across batches so a batch
+    // too small to complete a VAD frame doesn't spuriously read as silence.
+    let mut last_mic_speech = false;
+    let mut last_sys_speech = false;
     let mut next_index: u32 = 0;
     let mut kept_chunks: u32 = 0;
     let mut total = Duration::ZERO;
@@ -298,12 +330,25 @@ pub fn run(
             last_level_emit = std::time::Instant::now();
         }
 
-        // "silence across both legs" = both below threshold; use the max of the two
-        // as the gating signal so either leg alone can keep a chunk open.
-        let gate_rms = sys_rms.max(mic_rms);
-        let cut = chunker.feed(gate_rms, frames as u64);
+        // Speech on either leg keeps the chunk open — run mic and system legs
+        // independently through the VAD (or, if it failed to init, the old
+        // RMS threshold) rather than merging into one signal.
+        if let Some(vad) = vad.as_mut() {
+            let (mic_speech, sys_speech) = vad.feed(&buf, ch, &info);
+            if let Some(v) = mic_speech {
+                last_mic_speech = v;
+            }
+            if let Some(v) = sys_speech {
+                last_sys_speech = v;
+            }
+        } else {
+            last_mic_speech = mic_rms >= threshold;
+            last_sys_speech = sys_rms >= threshold;
+        }
+        let speech = last_mic_speech || last_sys_speech;
+        let cut = chunker.feed(speech, frames as u64);
 
-        let now_silent = gate_rms < threshold;
+        let now_silent = !speech;
         if now_silent != in_silence {
             in_silence = now_silent;
             let _ = tx.send(Status::Silence { in_silence });
@@ -538,24 +583,23 @@ fn compute_levels(buf: &[f32], ch: usize, info: &CaptureInfo) -> (f32, f32, f32,
 
 #[cfg(test)]
 mod tests {
-    use crate::types::DEFAULT_SILENCE_RMS;
     use super::*;
 
     const SR: u32 = 48_000;
 
     fn silent_frames(c: &mut Chunker, secs: f64) -> Option<Cut> {
         let frames = (SR as f64 * secs) as u64;
-        c.feed(0.0001, frames)
+        c.feed(false, frames)
     }
 
     fn loud_frames(c: &mut Chunker, secs: f64) -> Option<Cut> {
         let frames = (SR as f64 * secs) as u64;
-        c.feed(0.5, frames)
+        c.feed(true, frames)
     }
 
     #[test]
     fn short_silence_does_not_cut() {
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         assert!(loud_frames(&mut c, 1.0).is_none());
         // silence shorter than SILENCE_TO_CUT (2s)
         assert!(silent_frames(&mut c, 1.0).is_none());
@@ -563,7 +607,7 @@ mod tests {
 
     #[test]
     fn long_silence_cuts() {
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         assert!(loud_frames(&mut c, 1.0).is_none());
         let cut = silent_frames(&mut c, 2.5);
         assert_eq!(cut, Some(Cut::Silence));
@@ -573,7 +617,7 @@ mod tests {
     fn no_cut_without_speech_during_long_silence() {
         // Pure silence from the start: chunk never opens, so nothing to cut,
         // and no empty chunk should ever be created by the caller.
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         let cut = silent_frames(&mut c, 10.0);
         assert!(cut.is_none());
         assert!(!c.open);
@@ -581,7 +625,7 @@ mod tests {
 
     #[test]
     fn hard_cap_fires_with_no_silence() {
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         assert!(loud_frames(&mut c, 1.0).is_none());
         // Keep feeding loud audio past MAX_CHUNK (300s) with zero silence.
         let cut = loud_frames(&mut c, 300.0);
@@ -594,7 +638,7 @@ mod tests {
         // on disk is speech + a bounded 300ms trailing-silence tail (mirrors the
         // hold-buffer trim in `run`), not the full silence run — that combined
         // duration should fall under MIN_CHUNK so the caller discards it.
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         assert!(loud_frames(&mut c, 0.1).is_none()); // 100ms of speech
         let cut = silent_frames(&mut c, 2.5);
         assert_eq!(cut, Some(Cut::Silence));
@@ -605,7 +649,7 @@ mod tests {
 
     #[test]
     fn reset_after_cut_allows_reopening() {
-        let mut c = Chunker::new(SR, DEFAULT_SILENCE_RMS);
+        let mut c = Chunker::new(SR);
         assert!(loud_frames(&mut c, 1.0).is_none());
         assert_eq!(silent_frames(&mut c, 2.5), Some(Cut::Silence));
         c.reset_after_cut();

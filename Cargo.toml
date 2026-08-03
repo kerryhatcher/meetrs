@@ -9,7 +9,13 @@ repository = "https://github.com/kerryhatcher/meetrs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+# Pure-Rust neural VAD with an embedded model: no ONNX runtime, no model
+# download, nothing to sign. See docs/research/rust-audio-processing.md.
+earshot = "1.2.1"
 hound = "3.5.1"
+# For flock(2). Chosen over a PID file because the kernel releases a flock when
+# the process dies, even on SIGKILL — so there is no stale-lock case to handle.
+libc = "0.2.189"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 rtrb = "0.3.4"

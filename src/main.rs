@@ -6,8 +6,10 @@
 
 mod capture;
 mod chunk;
+mod lock;
 mod types;
 mod ui;
+mod vad;
 
 use anyhow::{Context, Result};
 use std::sync::mpsc;
@@ -20,6 +22,11 @@ const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
 fn main() -> Result<()> {
+    // Held for the whole process. Two instances would fight over the same audio
+    // device and interleave writes into the same recordings tree, so this covers
+    // `--check` too — it opens capture as well.
+    let _lock = lock::acquire()?;
+
     if std::env::args().any(|a| a == "--check") {
         return check();
     }

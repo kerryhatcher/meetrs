@@ -34,9 +34,21 @@ not apply to an already-running process.
 
 ## Use
 
+```sh
+just run        # build, bundle if needed, launch the TUI
+just check      # headless: report channel layout and per-leg levels
+just --list     # everything else
+```
+
 ```
 q / Esc / Ctrl-C   stop recording and flush
 ```
+
+Only one instance can run at a time. The second one exits immediately with
+`meetrs is already running`, enforced by an `flock` on `~/.meetrs/meetrs.lock`
+held by the process itself — so it holds however you launch it, not just through
+`just`. The kernel drops the lock when the process dies, including on `SIGKILL`,
+so there is no stale lock to clean up.
 
 Recordings land in `~/.meetrs/recordings/<timestamp>/`:
 
@@ -50,16 +62,18 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
 Each chunk is closed and `fsync`ed before the next opens, so the only audio at
 risk from a crash is the chunk in flight.
 
-## Calibrate the silence threshold first
+## Voice activity detection
 
-Chunking cuts on RMS falling below a threshold, and that threshold has to sit
-above your machine's noise floor and below speech. That gap is hardware- and
-environment-specific, so **measure it before trusting the chunking**:
+Chunk boundaries come from a VAD (`earshot`, a small pure-Rust neural model with
+embedded weights — no ONNX runtime, no model download). The mic and system legs
+are evaluated independently and a chunk stays open while *either* leg has speech.
 
-```sh
-# with nothing playing and the room quiet
-./target/debug/meetrs.app/Contents/MacOS/meetrs --check
-```
+This replaced an RMS threshold, which needed per-machine calibration and was the
+POC's worst edge. For the record of why: ambient mic noise on the author's machine
+measured 0.0105 RMS, which silently defeated the original 0.004 threshold — every
+chunk stayed open forever because the empty room read as sound.
+
+`--check` (or `just check`) still earns its keep as a diagnostic:
 
 ```
 channels=3 rate=48000 mic=(0, 0) system=(1, 2)
@@ -68,22 +82,12 @@ mic:    rms=0.009804 peak=0.090197
 system: rms=0.044603 peak=0.578206
 ```
 
-Pick a threshold above both idle RMS figures but below your speech level, and set
-it:
+Use it to confirm both legs carry signal, and to catch the process-tap
+zero-samples bug — if the system leg reports bit-exact zero while audio is audibly
+playing, that's the bug, not a quiet room.
 
-```sh
-MEETRS_SILENCE_RMS=0.06 ./target/debug/meetrs.app/Contents/MacOS/meetrs
-```
-
-If the threshold is too low, nothing ever reads as silence and you get one
-enormous chunk — which defeats the entire point of chunking. On the author's
-machine the built-in default of 0.004 did exactly that, because ambient mic noise
-alone measured 0.0105. The default is now 0.02, which is still too low if anything
-is playing audio in the background.
-
-`--check` is also the way to detect the process-tap zero-samples bug: if the
-system leg reports bit-exact zero while audio is audibly playing, that's the bug,
-not quiet audio.
+`MEETRS_SILENCE_RMS` still exists but only feeds the RMS fallback path, used if
+the VAD fails to initialize. It has no effect on normal operation.
 
 ## How chunking works
 
@@ -116,14 +120,16 @@ yourself.
 
 - **macOS only.** `docs/research/rust-audio-linux.md` has the PipeWire plan.
 - **No grooming.** Nothing is ever deleted. This will fill your disk.
-- **Silence detection is bare RMS**, not a real VAD. It cuts on quiet, not on
-  absence-of-speech, so a noisy room or any background audio defeats it and you
-  get one huge chunk. This is the weakest part of the POC and the reason
-  `--check` exists. `docs/research/rust-audio-processing.md` covers replacing it
-  with Silero VAD, which would remove the calibration step entirely.
-- **The threshold is global, not per-leg.** Background system audio holds chunks
-  open even when nobody is speaking, because the cut needs *both* legs quiet.
-  Per-leg thresholds would be a better model.
+- **Continuous system audio suppresses chunk splits.** A chunk stays open while
+  either leg has speech, so background music or a playing video holds one chunk
+  open until the 5-minute hard cap. Observed directly: two runs of the same test
+  produced 2 chunks and 1 chunk depending on whether background audio happened to
+  be playing. The hard cap still bounds crash loss, so this is a defensible
+  design rather than a defect — but if you want tighter chunks during a
+  screen-share, the cut rule needs to weight the mic leg over the system leg.
+- **VAD frames are decimated 48k to 16k with a 3-sample box filter**, not a
+  proper anti-alias filter. Cheap and adequate here; `rubato` is the upgrade if
+  aliasing ever shows up as false speech.
 - **The zero-samples bug is not fully ruled out.** Core Audio process taps have a
   documented failure mode where the tap looks healthy and delivers pure silence.
   If a recording comes back quiet, that's the first suspect — details and the

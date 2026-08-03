@@ -1,11 +1,13 @@
 //! meetrs — terminal meeting recorder.
 //!
 //! Captures microphone + system audio into one synchronized stream, writes WAV
-//! chunks split on natural pauses so a crash costs at most one chunk.
-//! Recording only; transcription is out of scope.
+//! chunks split on natural pauses so a crash costs at most one chunk, and
+//! transcribes each chunk locally as soon as it lands. State and a full-text
+//! index over transcripts live in SQLite at `~/.meetrs/meetrs.db`.
 
 mod capture;
 mod chunk;
+mod db;
 mod lock;
 mod model;
 mod transcribe;
@@ -24,6 +26,15 @@ const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
 fn main() -> Result<()> {
+    // Read-only queries don't touch the audio device, so they run without the
+    // single-instance lock — you can search while a recording is in progress.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--search") => return search(&args[1..].join(" ")),
+        Some("--reindex") => return reindex(),
+        _ => {}
+    }
+
     // Held for the whole process. Two instances would fight over the same audio
     // device and interleave writes into the same recordings tree, so this covers
     // `--check` too — it opens capture as well.
@@ -96,7 +107,9 @@ fn main() -> Result<()> {
     // the aggregate device is torn down and the current chunk closes.
     capture::stop();
     stop.stop();
-    let write_result = writer.join().map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+    let write_result = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
 
     // Restore the terminal before reporting anything.
     outcome?;
@@ -124,6 +137,50 @@ fn main() -> Result<()> {
 /// Small helper the UI uses to bound its redraw rate.
 pub const FRAME: Duration = Duration::from_millis(50);
 
+/// `--search <fts5 query>`: full-text search across every transcript.
+fn search(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        anyhow::bail!(
+            "usage: meetrs --search <query>\n\
+             supports FTS5 syntax: \"exact phrase\", term1 OR term2, budget*, NEAR(a b)"
+        );
+    }
+    let db = db::open()?;
+    let hits = db.search(query, 50)?;
+    if hits.is_empty() {
+        println!("no matches for {query:?}");
+        return Ok(());
+    }
+    for h in &hits {
+        println!(
+            "{}  {}  chunk-{:03} [{}]\n  {}\n  {}\n",
+            h.started_at,
+            fmt_hms(h.start_secs),
+            h.chunk_index,
+            h.leg,
+            h.snippet.replace('\n', " "),
+            h.session_dir
+        );
+    }
+    println!("{} match(es)", hits.len());
+    Ok(())
+}
+
+/// `--reindex`: rebuild the SQLite index from the JSON on disk. The DB is a
+/// derived artifact, so this is always safe — and it is the recovery path if the
+/// DB is deleted, corrupted, or was unavailable while recording.
+fn reindex() -> Result<()> {
+    let mut db = db::open()?;
+    let n = db.rebuild()?;
+    println!("indexed {n} chunk(s)");
+    Ok(())
+}
+
+fn fmt_hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
 /// `--check`: capture for a few seconds and report the negotiated layout plus
 /// per-leg signal level, then exit. No TUI, so it runs without a tty.
 ///
@@ -139,7 +196,8 @@ fn check() -> Result<()> {
     );
 
     let ch = info.channels as usize;
-    let (mut mic_sq, mut sys_sq, mut mic_peak, mut sys_peak, mut frames) = (0f64, 0f64, 0f32, 0f32, 0u64);
+    let (mut mic_sq, mut sys_sq, mut mic_peak, mut sys_peak, mut frames) =
+        (0f64, 0f64, 0f32, 0f32, 0u64);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {

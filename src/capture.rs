@@ -18,12 +18,17 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use block2::{DynBlock, RcBlock};
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::AnyThread;
 use objc2_core_audio::{
-    kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMainSubDeviceKey,
+    AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
+    AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
+    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
+    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertySelector, CATapDescription,
+    CATapMuteBehavior, kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMainSubDeviceKey,
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
     kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
     kAudioAggregateDeviceUIDKey, kAudioDevicePermissionsError, kAudioDevicePropertyDeviceUID,
@@ -32,17 +37,11 @@ use objc2_core_audio::{
     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput, kAudioObjectSystemObject,
     kAudioStreamPropertyVirtualFormat, kAudioSubDeviceDriftCompensationKey, kAudioSubDeviceUIDKey,
     kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyFormat,
-    AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
-    AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
-    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
-    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertySelector, CATapDescription,
-    CATapMuteBehavior,
 };
 use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
-    kAudioFormatLinearPCM, AudioBuffer, AudioBufferList, AudioStreamBasicDescription,
-    AudioTimeStamp,
+    kAudioFormatLinearPCM,
 };
 use objc2_core_foundation::{CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber};
@@ -259,8 +258,12 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
     }
     let mut stream_channels: Vec<usize> = Vec::with_capacity(stream_ids.len());
     for &sid in &stream_ids {
-        let format: AudioStreamBasicDescription =
-            get_property(sid, kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, None)?;
+        let format: AudioStreamBasicDescription = get_property(
+            sid,
+            kAudioStreamPropertyVirtualFormat,
+            kAudioObjectPropertyScopeGlobal,
+            None,
+        )?;
         validate_stream_format(&format)?;
         stream_channels.push(format.mChannelsPerFrame as usize);
     }
@@ -269,8 +272,12 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
     // The tap's own channel count is known independently of stream order
     // (the stereo initializer always yields 2, but query it rather than
     // hardcode -- confirms the tap leg is the one we think it is).
-    let tap_format: AudioStreamBasicDescription =
-        get_property(tap_id, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal, None)?;
+    let tap_format: AudioStreamBasicDescription = get_property(
+        tap_id,
+        kAudioTapPropertyFormat,
+        kAudioObjectPropertyScopeGlobal,
+        None,
+    )?;
     let tap_channels = tap_format.mChannelsPerFrame as usize;
 
     if stream_ids.len() < 2 {
@@ -423,9 +430,18 @@ fn discover_input_streams(device_id: AudioObjectID) -> Result<Vec<AudioObjectID>
     };
     let mut size: u32 = 0;
     let status = unsafe {
-        AudioObjectGetPropertyDataSize(device_id, NonNull::from(&mut address), 0, std::ptr::null(), NonNull::from(&mut size))
+        AudioObjectGetPropertyDataSize(
+            device_id,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+        )
     };
-    check(status, "AudioObjectGetPropertyDataSize(kAudioDevicePropertyStreams)")?;
+    check(
+        status,
+        "AudioObjectGetPropertyDataSize(kAudioDevicePropertyStreams)",
+    )?;
     let n = size as usize / size_of::<AudioObjectID>();
     let mut ids = vec![0u32; n];
     if n == 0 {
@@ -442,7 +458,10 @@ fn discover_input_streams(device_id: AudioObjectID) -> Result<Vec<AudioObjectID>
             NonNull::new(ids.as_mut_ptr() as *mut c_void).unwrap(),
         )
     };
-    check(status, "AudioObjectGetPropertyData(kAudioDevicePropertyStreams)")?;
+    check(
+        status,
+        "AudioObjectGetPropertyData(kAudioDevicePropertyStreams)",
+    )?;
     Ok(ids)
 }
 

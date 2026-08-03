@@ -62,7 +62,6 @@ pub struct CaptureInfo {
     pub mic_channels: (u16, u16),
 }
 
-
 /// Progress reported from the recording thread to the UI. Send-only, lossy by
 /// design: the UI dropping a Level update is fine, so the channel never blocks
 /// the writer.

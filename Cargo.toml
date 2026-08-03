@@ -19,6 +19,10 @@ libc = "0.2.189"
 # Proper 48k->16k resampling for the ASR feed. The VAD gets away with a box
 # filter; aliasing in the transcription input would cost accuracy.
 rubato = "4.0.0"
+# `bundled` compiles the SQLite amalgamation into this binary — no libsqlite3
+# dylib, same precedent as whisper.cpp. FTS5 is included in bundled builds
+# (verified: SQLite 3.53.2, highlight() and boolean MATCH both work).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 sha2 = "0.11.0"
 # whisper.cpp, compiled from vendored source into this binary. No dylib, no
 # external install. `metal` pulls in Apple's Metal + Accelerate frameworks.

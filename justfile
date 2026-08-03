@@ -29,6 +29,14 @@ run: bundle
 check: bundle
     exec "{{exe}}" --check
 
+# full-text search every transcript: just search "budget OR headcount"
+search +QUERY: bundle
+    exec "{{exe}}" --search {{QUERY}}
+
+# rebuild the SQLite index from the JSON on disk (safe: the DB is derived)
+reindex: bundle
+    exec "{{exe}}" --reindex
+
 # run the test suite
 test:
     cargo test

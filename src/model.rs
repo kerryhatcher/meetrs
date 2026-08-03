@@ -5,7 +5,7 @@
 //! touching the network. `MEETRS_MODEL` is the escape hatch for anyone who
 //! wants no network call at all, or a bigger model than the default.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::{self, File};
@@ -113,7 +113,10 @@ fn download(url: &str, dest_tmp: &Path, progress: &mut impl FnMut(u64, u64)) -> 
         file.write_all(&buf[..n]).context("writing model to disk")?;
         downloaded += n as u64;
 
-        let pct = downloaded.saturating_mul(100).checked_div(total).unwrap_or(0);
+        let pct = downloaded
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(0);
         if last_report.elapsed() >= Duration::from_millis(250) && (total == 0 || pct > last_pct) {
             progress(downloaded, total);
             last_report = Instant::now();
@@ -140,7 +143,11 @@ fn sha256_hex(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 #[cfg(test)]

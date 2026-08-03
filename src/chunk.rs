@@ -12,9 +12,9 @@ use anyhow::Result;
 use serde::Serialize;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -244,6 +244,24 @@ pub fn run(
     };
     write_meta_atomic(&dir, &meta)?;
 
+    // The DB is a derived index; meta.json above is the source of truth. So every
+    // DB call here is best-effort: a failure warns and degrades to "no index",
+    // it never costs a recording. `db::rebuild()` can repopulate later.
+    let mut db = match crate::db::open() {
+        Ok(mut d) => {
+            if let Err(e) = d.start_session(&dir, &info, &meta.detector, &meta.started) {
+                let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+            }
+            Some(d)
+        }
+        Err(e) => {
+            let _ = tx.send(Status::Warning(format!(
+                "db unavailable, not indexing: {e:#}"
+            )));
+            None
+        }
+    };
+
     let mut chunker = Chunker::new(info.sample_rate);
     // Last known per-leg speech decision — carried across batches so a batch
     // too small to complete a VAD frame doesn't spuriously read as silence.
@@ -400,7 +418,18 @@ pub fn run(
                     write_samples(&mut oc, &hold)?;
                 }
                 hold.clear();
-                finish_chunk(oc, &dir, &mut meta, &tx, &jobs, &mut kept_chunks, &mut total)?;
+                finish_chunk(
+                    oc,
+                    &dir,
+                    &mut meta,
+                    &mut Sinks {
+                        tx: &tx,
+                        jobs: &jobs,
+                        db: db.as_mut(),
+                    },
+                    &mut kept_chunks,
+                    &mut total,
+                )?;
                 next_index += 1;
             }
             chunker.reset_after_cut();
@@ -420,7 +449,24 @@ pub fn run(
         if !hold.is_empty() {
             write_samples(&mut oc, &hold)?;
         }
-        finish_chunk(oc, &dir, &mut meta, &tx, &jobs, &mut kept_chunks, &mut total)?;
+        finish_chunk(
+            oc,
+            &dir,
+            &mut meta,
+            &mut Sinks {
+                tx: &tx,
+                jobs: &jobs,
+                db: db.as_mut(),
+            },
+            &mut kept_chunks,
+            &mut total,
+        )?;
+    }
+
+    if let Some(db) = db.as_mut()
+        && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
+    {
+        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
     }
 
     let _ = tx.send(Status::Finished {
@@ -451,15 +497,24 @@ fn push_preroll(preroll: &mut Vec<f32>, batch: &[f32], ch: usize, cap_frames: u6
     }
 }
 
+/// Where a closed chunk gets reported: the UI, the transcription queue, and the
+/// (optional, best-effort) SQLite index.
+struct Sinks<'a> {
+    tx: &'a Sender<Status>,
+    jobs: &'a Sender<Job>,
+    db: Option<&'a mut crate::db::Db>,
+}
+
 fn finish_chunk(
     oc: OpenChunk,
     dir: &Path,
     meta: &mut Meta,
-    tx: &Sender<Status>,
-    jobs: &Sender<Job>,
+    sinks: &mut Sinks<'_>,
     kept_chunks: &mut u32,
     total: &mut Duration,
 ) -> Result<()> {
+    let tx = sinks.tx;
+    let jobs = sinks.jobs;
     let index = oc.index;
     let started_offset = oc.started_offset;
     let frames_written = oc.frames_written;
@@ -492,6 +547,23 @@ fn finish_chunk(
         started_offset_secs: started_offset.as_secs_f64(),
     });
     write_meta_atomic(dir, meta)?;
+
+    if let Some(db) = sinks.db.as_mut() {
+        let file = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Err(e) = db.record_chunk(
+            dir,
+            index,
+            &file,
+            duration.as_secs_f64(),
+            started_offset.as_secs_f64(),
+            bytes,
+        ) {
+            let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+        }
+    }
 
     // Queue for transcription only after meta.json is on disk — the worker reads
     // the channel map from it, so sending earlier would race.
@@ -557,7 +629,10 @@ fn compute_levels(buf: &[f32], ch: usize, info: &CaptureInfo) -> (f32, f32, f32,
     let mut mic_sq = 0f64;
     let mut sys_peak = 0f32;
     let mut mic_peak = 0f32;
-    let (s0, s1) = (info.system_channels.0 as usize, info.system_channels.1 as usize);
+    let (s0, s1) = (
+        info.system_channels.0 as usize,
+        info.system_channels.1 as usize,
+    );
     let (m0, m1) = (info.mic_channels.0 as usize, info.mic_channels.1 as usize);
 
     for f in 0..frames {
@@ -654,7 +729,10 @@ mod tests {
         assert_eq!(cut, Some(Cut::Silence));
         let tail_keep_frames = (SR as u64 * 300) / 1000;
         let duration = c.frames_to_duration(c.kept_frames(tail_keep_frames));
-        assert!(duration < MIN_CHUNK, "expected runt duration, got {duration:?}");
+        assert!(
+            duration < MIN_CHUNK,
+            "expected runt duration, got {duration:?}"
+        );
     }
 
     #[test]

@@ -35,9 +35,10 @@ not apply to an already-running process.
 ## Use
 
 ```sh
-just run        # build, bundle if needed, launch the TUI
-just check      # headless: report channel layout and per-leg levels
-just --list     # everything else
+just run                          # build, bundle if needed, launch the TUI
+just check                        # headless: channel layout and per-leg levels
+just search "budget OR headcount" # full-text search every transcript
+just --list                       # everything else
 ```
 
 ```
@@ -61,6 +62,8 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
   meta.json          channel map, detector, per-chunk offsets
   transcript.md      speaker-labelled, human-readable
 ```
+
+State and a full-text index live in a SQLite database at `~/.meetrs/meetrs.db`.
 
 `transcript.md` looks like this — the mic and system legs are transcribed
 separately, which gives speaker attribution with no diarization model:

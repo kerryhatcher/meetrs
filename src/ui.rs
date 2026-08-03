@@ -10,11 +10,11 @@
 use crate::chunk::StopFlag;
 use crate::types::{CaptureInfo, Status};
 use anyhow::Result;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
-use ratatui::Frame;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -425,9 +425,7 @@ fn draw_chunks(frame: &mut Frame, area: Rect, app: &App) {
         .collect();
     let mut items = items;
     for t in app.transcribed.iter() {
-        items.push(ListItem::new(format!(
-            "  ↳ {t}"
-        )));
+        items.push(ListItem::new(format!("  ↳ {t}")));
     }
     let list = List::new(items).block(
         Block::default()

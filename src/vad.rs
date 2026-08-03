@@ -88,10 +88,18 @@ impl Vad {
     /// channel count; `info` names which channel indices belong to each leg.
     /// Returns `(mic, sys)` speech decisions, each `None` when no full VAD
     /// frame completed for that leg this call.
-    pub fn feed(&mut self, buf: &[f32], ch: usize, info: &CaptureInfo) -> (Option<bool>, Option<bool>) {
+    pub fn feed(
+        &mut self,
+        buf: &[f32],
+        ch: usize,
+        info: &CaptureInfo,
+    ) -> (Option<bool>, Option<bool>) {
         let frames = buf.len() / ch;
         let (m0, m1) = (info.mic_channels.0 as usize, info.mic_channels.1 as usize);
-        let (s0, s1) = (info.system_channels.0 as usize, info.system_channels.1 as usize);
+        let (s0, s1) = (
+            info.system_channels.0 as usize,
+            info.system_channels.1 as usize,
+        );
 
         let mic_iter = (0..frames).map(|f| {
             let base = f * ch;
@@ -126,14 +134,25 @@ mod tests {
         // One sample short of a full 768-sample (256-frame * 3) VAD frame.
         let short = vec![0.0f32; 768 - 1];
         assert_eq!(leg.feed_mono48(short.into_iter()), None);
-        assert_eq!(leg.frame_buf.len(), 255, "255 decimated samples buffered, 1 raw sample pending");
+        assert_eq!(
+            leg.frame_buf.len(),
+            255,
+            "255 decimated samples buffered, 1 raw sample pending"
+        );
 
         // The single missing raw sample completes the last decimated sample,
         // which completes the 256th VAD frame sample.
         let rest = vec![0.0f32; 1];
         let decided = leg.feed_mono48(rest.into_iter());
-        assert!(decided.is_some(), "768th raw sample should complete a full VAD frame");
-        assert_eq!(leg.frame_buf.len(), 0, "frame buffer drains once a full frame is fed to the detector");
+        assert!(
+            decided.is_some(),
+            "768th raw sample should complete a full VAD frame"
+        );
+        assert_eq!(
+            leg.frame_buf.len(),
+            0,
+            "frame buffer drains once a full frame is fed to the detector"
+        );
     }
 
     #[test]

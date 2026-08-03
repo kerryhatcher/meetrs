@@ -107,7 +107,9 @@ fn session_relative_secs(offset: Duration, chunk_local_secs: f64) -> f64 {
 fn whisper_threads() -> i32 {
     // Leave at least one core for the audio callback + writer thread — an
     // overrun there is far worse than transcription running a bit slower.
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     cores.saturating_sub(1).max(1) as i32
 }
 
@@ -135,12 +137,16 @@ fn transcribe_leg(
         return Ok(Vec::new());
     }
     let mut state = ctx.create_state().context("creating whisper state")?;
-    state.full(full_params(), mono_16k).context("running whisper full()")?;
+    state
+        .full(full_params(), mono_16k)
+        .context("running whisper full()")?;
 
     let n = state.full_n_segments();
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let Some(seg) = state.get_segment(i) else { continue };
+        let Some(seg) = state.get_segment(i) else {
+            continue;
+        };
         let text = seg.to_str_lossy().unwrap_or_default().trim().to_string();
         // Whisper emits bracketed non-speech markers for silence. One leg is
         // quiet in most chunks (nobody talks over the whole meeting), so without
@@ -208,8 +214,15 @@ fn process_job(ctx: &WhisperContext, job: &Job, meta: &SessionMeta) -> Result<Pr
     segments.extend(transcribe_leg(ctx, &sys_16k, "system", job.offset)?);
     segments.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
 
-    let words = segments.iter().map(|s| s.text.split_whitespace().count()).sum();
-    Ok(Processed { segments, audio_secs, words })
+    let words = segments
+        .iter()
+        .map(|s| s.text.split_whitespace().count())
+        .sum();
+    Ok(Processed {
+        segments,
+        audio_secs,
+        words,
+    })
 }
 
 fn fmt_timestamp(secs: f64) -> String {
@@ -221,6 +234,19 @@ fn fmt_timestamp(secs: f64) -> String {
 }
 
 pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) -> Result<()> {
+    // Own connection for this thread (WAL makes that safe). Best-effort: the
+    // chunk-NNN.json files are authoritative, so a DB failure costs the index,
+    // never a transcript. `meetrs --reindex` can repopulate.
+    let mut db = match crate::db::open() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            let _ = tx.send(Status::Warning(format!(
+                "db unavailable, not indexing: {e:#}"
+            )));
+            None
+        }
+    };
+
     let ctx = WhisperContext::new_with_params(&model, WhisperContextParameters::default())
         .context("loading whisper model")?;
 
@@ -255,7 +281,9 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                         index: job.index,
                         err: format!("meta.json not ready: {e}"),
                     });
-                    let _ = tx.send(Status::TranscribeBacklog { pending: queue.len() });
+                    let _ = tx.send(Status::TranscribeBacklog {
+                        pending: queue.len(),
+                    });
                     continue;
                 }
             },
@@ -270,7 +298,9 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                     audio_secs: processed.audio_secs,
                     segments: processed.segments.clone(),
                 };
-                let json_path = job.path.with_file_name(format!("chunk-{:03}.json", job.index));
+                let json_path = job
+                    .path
+                    .with_file_name(format!("chunk-{:03}.json", job.index));
                 if let Err(e) = serde_json::to_vec_pretty(&chunk_json)
                     .context("serializing chunk json")
                     .and_then(|bytes| write_atomic(&json_path, &bytes))
@@ -289,12 +319,28 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                         seg.text
                     ));
                 }
-                if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes())
-                {
+                if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes()) {
                     let _ = tx.send(Status::Warning(format!(
                         "transcript.md write failed after chunk {}: {e}",
                         job.index
                     )));
+                }
+
+                if let Some(db) = db.as_mut() {
+                    let rows: Vec<crate::db::SegmentIn> = processed
+                        .segments
+                        .iter()
+                        .map(|s| crate::db::SegmentIn {
+                            leg: s.leg.to_string(),
+                            start_secs: s.start_secs,
+                            end_secs: s.end_secs,
+                            text: s.text.clone(),
+                            no_speech_prob: s.no_speech_prob,
+                        })
+                        .collect();
+                    if let Err(e) = db.record_segments(&dir, job.index, &rows) {
+                        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+                    }
                 }
 
                 let _ = tx.send(Status::TranscribeDone {
@@ -305,6 +351,11 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                 });
             }
             Err(e) => {
+                if let Some(db) = db.as_mut()
+                    && let Err(e2) = db.mark_chunk_failed(&dir, job.index, &e.to_string())
+                {
+                    let _ = tx.send(Status::Warning(format!("db: {e2:#}")));
+                }
                 let _ = tx.send(Status::TranscribeFailed {
                     index: job.index,
                     err: e.to_string(),
@@ -312,7 +363,9 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
             }
         }
 
-        let _ = tx.send(Status::TranscribeBacklog { pending: queue.len() });
+        let _ = tx.send(Status::TranscribeBacklog {
+            pending: queue.len(),
+        });
     }
 
     Ok(())
@@ -378,7 +431,14 @@ mod tests {
 
     #[test]
     fn non_speech_markers_are_filtered() {
-        for m in ["[BLANK_AUDIO]", "(silence)", "[ Silence ]", "[MUSIC]", "", "   "] {
+        for m in [
+            "[BLANK_AUDIO]",
+            "(silence)",
+            "[ Silence ]",
+            "[MUSIC]",
+            "",
+            "   ",
+        ] {
             assert!(is_non_speech_marker(m), "should filter {m:?}");
         }
         // Real speech must survive, including legitimate parentheticals.

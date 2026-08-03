@@ -8,6 +8,7 @@ use crate::types::{Job, Status};
 use anyhow::{Context, Result};
 use crustytts_core::ProofingStage;
 use crustytts_sentence::SentenceNormalizer;
+use crustytts_spellcheck::SpellChecker;
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters};
 use serde::{Deserialize, Serialize};
@@ -227,6 +228,14 @@ fn process_job(ctx: &WhisperContext, job: &Job, meta: &SessionMeta) -> Result<Pr
     })
 }
 
+/// Human-readable polish for one segment: spelling first, then sentence
+/// boundaries/capitalization. Order matters — the normalizer capitalizes
+/// sentence starts, and a Capitalized word is treated as a name and skipped
+/// by the spell checker.
+fn polish(spell: &SpellChecker, sentences: &SentenceNormalizer, text: &str) -> String {
+    sentences.proof(&spell.correct(text))
+}
+
 fn fmt_timestamp(secs: f64) -> String {
     let total_ms = (secs * 1000.0).round() as i64;
     let h = total_ms / 3_600_000;
@@ -253,6 +262,12 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
     // arrive uncapitalized and unpunctuated. This is deterministic and idempotent
     // — already-clean output passes through untouched.
     let sentences = SentenceNormalizer::new();
+
+    // Whisper coins non-words when it mishears an onset ("Fox" -> "Thox"). The
+    // embedded dictionary + edit distance fixes those; anything Capitalized is
+    // left alone so names and jargon survive. Runs BEFORE the normalizer, which
+    // capitalizes sentence starts and would otherwise hide a leading typo.
+    let spell = SpellChecker::new();
 
     let ctx = WhisperContext::new_with_params(&model, WhisperContextParameters::default())
         .context("loading whisper model")?;
@@ -323,7 +338,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                         "**[{}] {}:** {}\n\n",
                         fmt_timestamp(seg.start_secs),
                         seg.leg,
-                        sentences.proof(&seg.text)
+                        polish(&spell, &sentences, &seg.text)
                     ));
                 }
                 if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes()) {
@@ -457,6 +472,27 @@ mod tests {
         ] {
             assert!(!is_non_speech_marker(s), "should keep {s:?}");
         }
+    }
+
+    #[test]
+    fn polish_fixes_typos_and_leaves_names_alone() {
+        let spell = SpellChecker::new();
+        let sentences = SentenceNormalizer::new();
+        // Whisper-style non-word gets corrected, and the sentence is capitalized.
+        assert_eq!(
+            polish(&spell, &sentences, "we are recordng the meetng"),
+            "We are recording the meeting."
+        );
+        // Ambiguous non-words are left alone rather than guessed at: "browm" is
+        // one edit from both "brown" and "brow", so nothing is applied.
+        assert_eq!(
+            polish(&spell, &sentences, "the quick browm fox"),
+            "The quick browm fox."
+        );
+        // Names and jargon are Capitalized, so they survive untouched.
+        let kept = polish(&spell, &sentences, "Kerry shipped meetrs today");
+        assert!(kept.contains("Kerry"), "{kept}");
+        assert!(kept.contains("meetrs"), "{kept}");
     }
 
     #[test]

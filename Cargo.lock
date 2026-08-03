@@ -403,6 +403,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crustytts-spellcheck"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b416371333e47bc0e7f8af768fad83a49d0db47f5c2737e82460b0997ee9a9"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,6 +1039,7 @@ dependencies = [
  "crossterm",
  "crustytts-core",
  "crustytts-sentence",
+ "crustytts-spellcheck",
  "dispatch2",
  "earshot",
  "hound",

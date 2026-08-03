@@ -14,6 +14,10 @@ chrono = "0.4.45"
 # no network. https://github.com/kerryhatcher/crustytts
 crustytts-core = "0.3.4"
 crustytts-sentence = "0.3.4"
+# default-features = false: the embedded word list + edit-distance correction is
+# all we want. The default `full` feature adds symspell/spellbook/nlprule (each
+# needs dictionary files at runtime) and ollama (reqwest, +254 crates, network).
+crustytts-spellcheck = { version = "0.4.0", default-features = false }
 # Pure-Rust neural VAD with an embedded model: no ONNX runtime, no model
 # download, nothing to sign. See docs/research/rust-audio-processing.md.
 earshot = "1.2.1"

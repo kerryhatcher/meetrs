@@ -146,10 +146,17 @@ yourself.
 - **Transcript polish is deterministic, not a language model.**
   [`crustytts-sentence`](https://github.com/kerryhatcher/crustytts) restores
   capitalization and terminal punctuation in `transcript.md`, which helps the
-  short fragments whisper emits without punctuation. It cannot fix ASR errors
-  that are themselves valid words — "quick brown" heard as "quick-brand" stays
-  wrong, because no spell or grammar checker sees a misspelling. `chunk-NNN.json`
-  keeps whisper's raw output either way.
+  short fragments whisper emits without punctuation. It does not attempt to fix
+  transcription errors. `chunk-NNN.json` keeps whisper's raw output either way.
+- **Observed `base.en` error modes**, from real output: dropped word boundaries
+  (`QuickBrown`), substituted onsets (`Fox` -> `Thox`), and dropped initial
+  consonants (`brand` -> `rand`). Several of those are non-words, so a spell
+  checker could plausibly help — worth testing rather than assuming either way.
+  A larger model is the more direct fix.
+- **Don't evaluate accuracy with synthesized speech.** macOS `say`'s default
+  voice mispronounces some words (it renders "brown" close to "brand"), so a
+  wrong transcript can be the test harness rather than the recognizer. Pin a
+  named voice (`say -v Alex`) when generating test audio, or use real speech.
 - **VAD frames are decimated 48k to 16k with a 3-sample box filter**, not a
   proper anti-alias filter. Cheap and adequate here; `rubato` is the upgrade if
   aliasing ever shows up as false speech.

@@ -69,6 +69,15 @@ fn main() -> Result<()> {
     .context("obtaining a Whisper model")?;
     eprintln!();
 
+    // Create and migrate the index once, here, before any worker thread opens
+    // it. Failing to index is not worth aborting a recording over, so this warns
+    // rather than returning — but it warns to stdout, before the TUI exists.
+    if let Err(e) = db::init() {
+        eprintln!(
+            "meetrs: search index unavailable ({e:#}); recording anyway, run --reindex later"
+        );
+    }
+
     let (info, consumer) = capture::start(RING_SAMPLES).context(
         "starting audio capture — if this is a permissions failure, see the README \
          section on TCC consent and codesigning",

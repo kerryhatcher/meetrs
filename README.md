@@ -124,6 +124,7 @@ thresholds live in [`src/types.rs`](src/types.rs).
 | `src/capture.rs` | Core Audio process tap + mic in one aggregate device, one IOProc |
 | `src/chunk.rs` | Silence state machine, WAV writing, `meta.json` |
 | `src/ui.rs` | Ratatui level meters and chunk list |
+| `src/db.rs` | SQLite state + FTS5 index (derived, rebuildable) |
 
 Capture builds a single aggregate device containing both a global process tap and
 the default input device, with drift compensation on both legs, and installs one
@@ -142,6 +143,13 @@ yourself.
   be playing. The hard cap still bounds crash loss, so this is a defensible
   design rather than a defect — but if you want tighter chunks during a
   screen-share, the cut rule needs to weight the mic leg over the system leg.
+- **Transcript polish is deterministic, not a language model.**
+  [`crustytts-sentence`](https://github.com/kerryhatcher/crustytts) restores
+  capitalization and terminal punctuation in `transcript.md`, which helps the
+  short fragments whisper emits without punctuation. It cannot fix ASR errors
+  that are themselves valid words — "quick brown" heard as "quick-brand" stays
+  wrong, because no spell or grammar checker sees a misspelling. `chunk-NNN.json`
+  keeps whisper's raw output either way.
 - **VAD frames are decimated 48k to 16k with a 3-sample box filter**, not a
   proper anti-alias filter. Cheap and adequate here; `rubato` is the upgrade if
   aliasing ever shows up as false speech.

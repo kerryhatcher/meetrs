@@ -9,6 +9,11 @@ repository = "https://github.com/kerryhatcher/meetrs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+# Deterministic sentence-boundary detection, capitalization, and punctuation
+# restoration for the human-readable transcript. Zero transitive deps, no models,
+# no network. https://github.com/kerryhatcher/crustytts
+crustytts-core = "0.3.4"
+crustytts-sentence = "0.3.4"
 # Pure-Rust neural VAD with an embedded model: no ONNX runtime, no model
 # download, nothing to sign. See docs/research/rust-audio-processing.md.
 earshot = "1.2.1"

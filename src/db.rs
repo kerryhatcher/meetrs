@@ -21,6 +21,20 @@ fn recordings_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".meetrs").join("recordings"))
 }
 
+/// Open once at startup, before spawning any worker thread, and drop it.
+///
+/// This is the structural fix for the migration race, not just a nicety: when
+/// two threads open a *fresh* database simultaneously they both try to build the
+/// schema, and the loser used to die with "table sessions already exists",
+/// silently disabling indexing for that thread's whole session. `migrate()` is
+/// now race-safe on its own (BEGIN IMMEDIATE), but doing it once here means the
+/// concurrent case never arises, and a broken database is reported once, up
+/// front, in plain stdout — rather than twice, from inside two threads, as
+/// warnings competing with a TUI that has already taken the screen.
+pub fn init() -> Result<()> {
+    open().map(drop)
+}
+
 /// Opens (creating and migrating if needed) ~/.meetrs/meetrs.db
 pub fn open() -> Result<Db> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;

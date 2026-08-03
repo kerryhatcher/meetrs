@@ -388,6 +388,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crustytts-core"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3ba21484fad591ae71cf1e9ff1ffdaa0fc5253ee314acd84f6cbb43818ceb25"
+
+[[package]]
+name = "crustytts-sentence"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c8deca4e0efa68235d292ce660b9447112dfcba2b0370c29874fee0ccfb2854"
+dependencies = [
+ "crustytts-core",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1016,6 +1031,8 @@ dependencies = [
  "block2",
  "chrono",
  "crossterm",
+ "crustytts-core",
+ "crustytts-sentence",
  "dispatch2",
  "earshot",
  "hound",

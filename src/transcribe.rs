@@ -6,6 +6,8 @@
 
 use crate::types::{Job, Status};
 use anyhow::{Context, Result};
+use crustytts_core::ProofingStage;
+use crustytts_sentence::SentenceNormalizer;
 use rubato::audioadapter_buffers::owned::InterleavedOwned;
 use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters};
 use serde::{Deserialize, Serialize};
@@ -247,6 +249,11 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
         }
     };
 
+    // Whisper's segments are timestamp-bounded fragments, so short ones often
+    // arrive uncapitalized and unpunctuated. This is deterministic and idempotent
+    // — already-clean output passes through untouched.
+    let sentences = SentenceNormalizer::new();
+
     let ctx = WhisperContext::new_with_params(&model, WhisperContextParameters::default())
         .context("loading whisper model")?;
 
@@ -316,7 +323,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                         "**[{}] {}:** {}\n\n",
                         fmt_timestamp(seg.start_secs),
                         seg.leg,
-                        seg.text
+                        sentences.proof(&seg.text)
                     ));
                 }
                 if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes()) {

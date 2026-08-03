@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -30,6 +30,10 @@ const PEAK_HOLD: Duration = Duration::from_millis(1500);
 
 /// How many closed chunks to remember for the durability list.
 const CHUNK_HISTORY: usize = 50;
+
+/// How many transcript lines to keep on screen. Bounded because a long meeting
+/// would otherwise grow this without limit — transcript.md is the full record.
+const TRANSCRIPT_HISTORY: usize = 200;
 
 const FLOOR_DB: f32 = -60.0;
 
@@ -114,6 +118,8 @@ struct App {
     /// Chunks closed but not yet transcribed. Growing means falling behind.
     backlog: usize,
     transcribed: VecDeque<String>,
+    /// Live transcript lines, newest first — same order as every other pane.
+    transcript: VecDeque<String>,
 }
 
 impl App {
@@ -135,6 +141,7 @@ impl App {
             transcribing: None,
             backlog: 0,
             transcribed: VecDeque::with_capacity(CHUNK_HISTORY),
+            transcript: VecDeque::with_capacity(TRANSCRIPT_HISTORY),
         }
     }
 
@@ -205,6 +212,16 @@ impl App {
                 ));
                 while self.transcribed.len() > CHUNK_HISTORY {
                     self.transcribed.pop_back();
+                }
+            }
+            Status::Transcript { lines, .. } => {
+                // Newest first, so reverse this chunk's lines as they go in —
+                // otherwise a chunk's own segments would read back-to-front.
+                for line in lines.into_iter().rev() {
+                    self.transcript.push_front(line);
+                }
+                while self.transcript.len() > TRANSCRIPT_HISTORY {
+                    self.transcript.pop_back();
                 }
             }
             Status::TranscribeFailed { index, err } => {
@@ -321,7 +338,7 @@ fn draw(frame: &mut Frame, app: &mut App, dir_display: &str, now: Instant) {
     draw_status(frame, rows[idx], app);
     idx += 1;
     if list_h > 0 {
-        draw_chunks(frame, rows[idx], app);
+        draw_bottom(frame, rows[idx], app);
         idx += 1;
     }
     draw_footer(frame, rows[idx]);
@@ -410,6 +427,40 @@ fn draw_warning(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Chunks on the left, live transcript on the right. Below MIN_SPLIT_WIDTH two
+/// bordered columns leave too few usable characters for either to be readable,
+/// so the transcript takes the whole pane — it's the half worth reading.
+const MIN_SPLIT_WIDTH: u16 = 60;
+
+fn draw_bottom(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width < MIN_SPLIT_WIDTH {
+        draw_transcript(frame, area, app);
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+    draw_chunks(frame, cols[0], app);
+    draw_transcript(frame, cols[1], app);
+}
+
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
+    let text: Vec<Line> = app
+        .transcript
+        .iter()
+        .map(|l| Line::raw(l.as_str()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("transcript (newest first)"),
+        ),
+        area,
+    );
+}
+
 fn draw_chunks(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = app
         .chunks
@@ -430,11 +481,61 @@ fn draw_chunks(frame: &mut Frame, area: Rect, app: &App) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("chunks · transcripts (newest first)"),
+            .title("chunks (newest first)"),
     );
     frame.render_widget(list, area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new("q quit"), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transcript(app: &App) -> Vec<&str> {
+        app.transcript.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn transcript_is_newest_first_but_keeps_each_chunk_in_order() {
+        let mut app = App::new();
+        let now = Instant::now();
+        app.apply(
+            Status::Transcript {
+                index: 0,
+                lines: vec!["a1".into(), "a2".into()],
+            },
+            now,
+        );
+        app.apply(
+            Status::Transcript {
+                index: 1,
+                lines: vec!["b1".into(), "b2".into()],
+            },
+            now,
+        );
+        // Newest chunk on top, and within a chunk the segments stay in the
+        // order they were spoken.
+        assert_eq!(transcript(&app), vec!["b1", "b2", "a1", "a2"]);
+    }
+
+    #[test]
+    fn transcript_is_bounded() {
+        let mut app = App::new();
+        let now = Instant::now();
+        for i in 0..TRANSCRIPT_HISTORY + 10 {
+            app.apply(
+                Status::Transcript {
+                    index: i as u32,
+                    lines: vec![format!("line {i}")],
+                },
+                now,
+            );
+        }
+        assert_eq!(app.transcript.len(), TRANSCRIPT_HISTORY);
+        // The oldest lines are the ones dropped.
+        assert_eq!(app.transcript.front().unwrap(), "line 209");
+    }
 }

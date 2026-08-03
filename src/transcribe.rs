@@ -333,13 +333,20 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                     )));
                 }
 
+                // Polish once per segment and reuse it for both sinks: the
+                // markdown file and the live UI must never disagree.
+                let mut lines = Vec::with_capacity(processed.segments.len());
                 for seg in &processed.segments {
-                    transcript_md.push_str(&format!(
-                        "**[{}] {}:** {}\n\n",
-                        fmt_timestamp(seg.start_secs),
-                        seg.leg,
-                        polish(&spell, &sentences, &seg.text)
-                    ));
+                    let ts = fmt_timestamp(seg.start_secs);
+                    let text = polish(&spell, &sentences, &seg.text);
+                    transcript_md.push_str(&format!("**[{}] {}:** {}\n\n", ts, seg.leg, text));
+                    lines.push(format!("[{}] {}: {}", ts, seg.leg, text));
+                }
+                if !lines.is_empty() {
+                    let _ = tx.send(Status::Transcript {
+                        index: job.index,
+                        lines,
+                    });
                 }
                 if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes()) {
                     let _ = tx.send(Status::Warning(format!(

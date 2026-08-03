@@ -111,6 +111,10 @@ pub enum Status {
         audio: Duration,
         words: usize,
     },
+    /// Polished transcript lines for one chunk, already formatted for display
+    /// (`[hh:mm:ss] leg: text`). Sent alongside TranscribeDone so the UI can
+    /// stream the words themselves, not just the throughput stats.
+    Transcript { index: u32, lines: Vec<String> },
     /// Transcription failed for one chunk. Never fatal — the audio is already
     /// safely on disk, which is the guarantee that matters.
     TranscribeFailed { index: u32, err: String },

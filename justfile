@@ -6,6 +6,11 @@ bin := "target/" + profile + "/meetrs"
 app := bin + ".app"
 exe := app + "/Contents/MacOS/meetrs"
 
+# where `just install` puts things. appdir holds the bundle (TCC consent is keyed
+# to it, so it needs a stable home outside target/); bindir holds the PATH entry.
+appdir := env("MEETRS_APPDIR", "$HOME/Applications")
+bindir := env("MEETRS_BINDIR", "$HOME/.local/bin")
+
 # list available recipes
 default:
     @just --list
@@ -37,11 +42,47 @@ search +QUERY: bundle
 reindex: bundle
     exec "{{exe}}" --reindex
 
-# compress older sessions to FLAC (new ones compress themselves at session end).
 # Deletes a chunk's WAV only after its FLAC verifies; untranscribed chunks are
-# left alone. Pass session dirs to limit it: just compress ~/.meetrs/recordings/2026-08-03T17-57-50
+# left alone. New sessions compress themselves at session end.
+#
+# compress older sessions to FLAC: just compress [session-dir...]
 compress *DIRS: bundle
     exec "{{exe}}" --compress {{DIRS}}
+
+# install so `meetrs` works from any directory, recording included
+install: bundle
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="{{appdir}}/meetrs.app"
+    link="{{bindir}}/meetrs"
+
+    # The PATH entry is a symlink INTO the bundle, not a copy of the binary.
+    # TCC keys audio consent to the bundle's Info.plist and code signature, so a
+    # bare binary on PATH (what `cargo install` produces) can never be granted
+    # microphone or system-audio access — see scripts/bundle.sh.
+    mkdir -p "{{appdir}}" "{{bindir}}"
+    rm -rf "$dest"
+    cp -R "{{app}}" "$dest"
+    # Re-sign after the copy so the installed bundle's ad-hoc signature covers
+    # the files at their final path.
+    codesign -s - -f "$dest" >/dev/null 2>&1
+    ln -sfn "$dest/Contents/MacOS/meetrs" "$link"
+
+    echo "installed $dest"
+    echo "linked    $link"
+
+    case ":$PATH:" in
+        *":{{bindir}}:"*) ;;
+        *) echo; echo "WARNING: {{bindir}} is not on your PATH — add it or set MEETRS_BINDIR." ;;
+    esac
+
+    # A bare `cargo install` binary earlier on PATH would silently take over and
+    # fail to record, which is a miserable thing to debug.
+    if [ -e "$HOME/.cargo/bin/meetrs" ] && [ ! -L "$HOME/.cargo/bin/meetrs" ]; then
+        echo
+        echo "NOTE: ~/.cargo/bin/meetrs is a bare binary and cannot get audio consent."
+        echo "      Remove it so it can never shadow this install:  cargo uninstall meetrs"
+    fi
 
 # run the test suite
 test:

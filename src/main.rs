@@ -38,8 +38,13 @@ fn main() -> Result<()> {
 
     // Held for the whole process. Two instances would fight over the same audio
     // device and interleave writes into the same recordings tree, so this covers
-    // `--check` too — it opens capture as well.
+    // `--check` too — it opens capture as well. `--compress` takes it as well:
+    // it deletes audio files, which must never happen under a live recording.
     let _lock = lock::acquire()?;
+
+    if args.first().map(String::as_str) == Some("--compress") {
+        return compress_old(&args[1..]);
+    }
 
     // whisper.cpp and ggml log to stderr by default, which would scribble over
     // the TUI's alternate screen. This reroutes them into the `log` crate, and
@@ -157,6 +162,64 @@ fn main() -> Result<()> {
     }
 
     println!("{}", dir.display());
+    Ok(())
+}
+
+/// `--compress [dir...]`: compress sessions recorded before this was automatic.
+/// With no arguments it sweeps every session under `~/.meetrs/recordings`;
+/// already-compressed sessions have no WAVs left and cost a directory listing.
+///
+/// Chunks that were never transcribed keep their WAVs — see `compress::run`.
+fn compress_old(dirs: &[String]) -> Result<()> {
+    let sessions: Vec<std::path::PathBuf> = if dirs.is_empty() {
+        compress::sessions()?
+    } else {
+        dirs.iter().map(std::path::PathBuf::from).collect()
+    };
+    if sessions.is_empty() {
+        println!("no recordings to compress");
+        return Ok(());
+    }
+
+    let mut total = compress::Savings::default();
+    for dir in &sessions {
+        let mut warn = |msg: String| eprintln!("meetrs: {}: {msg}", dir.display());
+        match compress::run(dir, &mut warn) {
+            Ok(s) => {
+                if s.files > 0 {
+                    println!(
+                        "{}: {} chunk(s), {:.1} MB → {:.1} MB ({:.0}% smaller)",
+                        dir.display(),
+                        s.files,
+                        s.before as f64 / 1e6,
+                        s.after as f64 / 1e6,
+                        s.percent_saved()
+                    );
+                }
+                total.files += s.files;
+                total.before += s.before;
+                total.after += s.after;
+            }
+            // One unreadable session must not abort the sweep.
+            Err(e) => eprintln!("meetrs: {}: skipped: {e:#}", dir.display()),
+        }
+    }
+
+    if total.files == 0 {
+        println!(
+            "nothing to compress ({} session(s) checked)",
+            sessions.len()
+        );
+    } else {
+        println!(
+            "total: {} chunk(s) across {} session(s), {:.1} MB → {:.1} MB ({:.0}% smaller)",
+            total.files,
+            sessions.len(),
+            total.before as f64 / 1e6,
+            total.after as f64 / 1e6,
+            total.percent_saved()
+        );
+    }
     Ok(())
 }
 

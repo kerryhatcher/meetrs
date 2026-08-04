@@ -141,12 +141,14 @@ pub fn models_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".meetrs").join("models"))
 }
 
-/// Where a session's files live: `~/.meetrs/recordings/<rfc3339-ish timestamp>/`.
-pub fn session_dir(started: chrono::DateTime<chrono::Local>) -> anyhow::Result<PathBuf> {
+/// Where every session lives: `~/.meetrs/recordings/`.
+pub fn recordings_dir() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate ~/.meetrs"))?;
-    Ok(PathBuf::from(home)
-        .join(".meetrs")
-        .join("recordings")
-        .join(started.format("%Y-%m-%dT%H-%M-%S").to_string()))
+    Ok(PathBuf::from(home).join(".meetrs").join("recordings"))
+}
+
+/// Where a session's files live: `~/.meetrs/recordings/<rfc3339-ish timestamp>/`.
+pub fn session_dir(started: chrono::DateTime<chrono::Local>) -> anyhow::Result<PathBuf> {
+    Ok(recordings_dir()?.join(started.format("%Y-%m-%dT%H-%M-%S").to_string()))
 }

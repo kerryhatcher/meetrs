@@ -37,6 +37,12 @@ search +QUERY: bundle
 reindex: bundle
     exec "{{exe}}" --reindex
 
+# compress older sessions to FLAC (new ones compress themselves at session end).
+# Deletes a chunk's WAV only after its FLAC verifies; untranscribed chunks are
+# left alone. Pass session dirs to limit it: just compress ~/.meetrs/recordings/2026-08-03T17-57-50
+compress *DIRS: bundle
+    exec "{{exe}}" --compress {{DIRS}}
+
 # run the test suite
 test:
     cargo test

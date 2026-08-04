@@ -16,10 +16,7 @@ pub struct Db {
     conn: Connection,
 }
 
-fn recordings_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".meetrs").join("recordings"))
-}
+use crate::types::recordings_dir;
 
 /// Open once at startup, before spawning any worker thread, and drop it.
 ///

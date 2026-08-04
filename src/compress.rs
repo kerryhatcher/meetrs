@@ -56,6 +56,13 @@ pub fn run(dir: &Path, warn: &mut dyn FnMut(String)) -> Result<Savings> {
     let mut renamed: Vec<(String, String)> = Vec::new();
 
     for wav in wav_chunks(dir)? {
+        // `chunk-NNN.json` is written only on a successful transcription, so its
+        // absence means this chunk still needs its float WAV. Load-bearing for
+        // `--compress`, which sweeps sessions this process never recorded.
+        if !wav.with_extension("json").exists() {
+            warn(format!("{} not transcribed yet, left alone", name(&wav)));
+            continue;
+        }
         let flac = wav.with_extension("flac");
         let before = std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0);
         match compress_one(&wav, &flac) {
@@ -89,6 +96,24 @@ pub fn run(dir: &Path, warn: &mut dyn FnMut(String)) -> Result<Savings> {
     }
 
     Ok(savings)
+}
+
+/// Every session directory under `~/.meetrs/recordings`, oldest first. Returns
+/// an empty list rather than an error when there are no recordings yet.
+pub fn sessions() -> Result<Vec<PathBuf>> {
+    let base = crate::types::recordings_dir()?;
+    let entries = match std::fs::read_dir(&base) {
+        Ok(e) => e,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    // Names are timestamps, so lexical order is chronological.
+    dirs.sort();
+    Ok(dirs)
 }
 
 fn name(p: &Path) -> String {
@@ -243,11 +268,22 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    /// A transcribed chunk: the WAV plus the `chunk-NNN.json` that proves ASR
+    /// ran, which is what `run` requires before it will touch the audio.
+    fn write_transcribed_chunk(dir: &Path, index: u32, frames: u32) {
+        write_wav(&dir.join(format!("chunk-{index:03}.wav")), frames);
+        std::fs::write(
+            dir.join(format!("chunk-{index:03}.json")),
+            format!(r#"{{"index":{index},"segments":[]}}"#),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn compresses_chunks_repoints_meta_and_removes_the_wavs() {
         let dir = scratch("happy");
-        write_wav(&dir.join("chunk-000.wav"), 24_000);
-        write_wav(&dir.join("chunk-001.wav"), 24_000);
+        write_transcribed_chunk(&dir, 0, 24_000);
+        write_transcribed_chunk(&dir, 1, 24_000);
         // A non-chunk wav must be left alone.
         write_wav(&dir.join("scratch.wav"), 480);
         std::fs::write(
@@ -291,10 +327,46 @@ mod tests {
     }
 
     #[test]
+    fn an_untranscribed_chunk_keeps_its_wav() {
+        let dir = scratch("untranscribed");
+        // WAV with no chunk-000.json: transcription never succeeded for it, so
+        // the float audio has to survive a --compress sweep.
+        write_wav(&dir.join("chunk-000.wav"), 4_800);
+        write_transcribed_chunk(&dir, 1, 4_800);
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"chunks":[{"index":0,"file":"chunk-000.wav"},
+                          {"index":1,"file":"chunk-001.wav"}]}"#,
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let savings = run(&dir, &mut |w| warnings.push(w)).unwrap();
+
+        assert_eq!(savings.files, 1, "only the transcribed chunk");
+        assert!(dir.join("chunk-000.wav").exists());
+        assert!(!dir.join("chunk-000.flac").exists());
+        assert!(!dir.join("chunk-001.wav").exists());
+        assert!(dir.join("chunk-001.flac").exists());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not transcribed"), "{warnings:?}");
+
+        // Only the compressed chunk is repointed; the skipped one still names
+        // the WAV that is still there.
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["chunks"][0]["file"], "chunk-000.wav");
+        assert_eq!(meta["chunks"][1]["file"], "chunk-001.flac");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_unencodable_file_keeps_its_wav_and_warns() {
         let dir = scratch("bad");
         // Not audio at all: afconvert must fail and the file must survive.
         std::fs::write(dir.join("chunk-000.wav"), b"definitely not a wav").unwrap();
+        std::fs::write(dir.join("chunk-000.json"), b"{}").unwrap();
 
         let mut warnings = Vec::new();
         let savings = run(&dir, &mut |w| warnings.push(w)).unwrap();

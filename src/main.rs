@@ -333,7 +333,30 @@ fn check() -> Result<()> {
     capture::stop();
 
     if frames == 0 {
-        anyhow::bail!("no frames arrived at all — capture started but delivered nothing");
+        // "Nothing arrived" has several very different causes that look the same
+        // from here, so report which one it was instead of just the symptom.
+        let io = capture::io_stats();
+        let why = if io.calls == 0 {
+            "the IOProc was never invoked — Core Audio never started the device or \
+             never registered the block (macOS 26 silently no-ops a nil dispatch queue)"
+        } else if io.shape_mismatch == io.calls {
+            "every cycle was dropped because the device's buffer count disagreed with \
+             the stream layout discovered at start()"
+        } else if io.empty == io.calls {
+            "the IOProc ran but every buffer was empty or null"
+        } else {
+            "the IOProc ran and produced buffers, but nothing reached the ring buffer"
+        };
+        anyhow::bail!(
+            "no frames arrived at all — capture started but delivered nothing.\n\
+             {why}.\n\
+             ioproc calls={} shape-mismatch={} empty={} last mNumberBuffers={} (expected {})",
+            io.calls,
+            io.shape_mismatch,
+            io.empty,
+            io.last_n_buffers,
+            io.expected_n_buffers,
+        );
     }
     let rms = |sq: f64, n: u64| (sq / n as f64).sqrt() as f32;
     println!(

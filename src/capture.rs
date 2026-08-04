@@ -88,10 +88,51 @@ struct State {
 static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
 static DROPPED_SAMPLES: AtomicU64 = AtomicU64::new(0);
 
+// The IOProc drops a cycle silently in three cases, and all three present
+// identically from outside: no samples arrive. Counting them is the difference
+// between "the callback never ran" and "the callback ran and we threw it all
+// away", which are completely different bugs. Relaxed ordering throughout: these
+// are diagnostics read after the fact, never synchronization.
+static IOPROC_CALLS: AtomicU64 = AtomicU64::new(0);
+static SHAPE_MISMATCH: AtomicU64 = AtomicU64::new(0);
+static EMPTY_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// `mNumberBuffers` from the most recent callback, so a shape mismatch can say
+/// what the device actually handed us instead of just that it disagreed.
+static LAST_N_BUFFERS: AtomicU64 = AtomicU64::new(0);
+/// Buffer count `start()` discovered, i.e. what the callback demands.
+static EXPECTED_N_BUFFERS: AtomicU64 = AtomicU64::new(0);
+
 /// Samples dropped because the ring buffer was full. The writer should poll
 /// this and surface `Status::Overrun` on increase.
 pub fn dropped_samples() -> u64 {
     DROPPED_SAMPLES.load(Ordering::Relaxed)
+}
+
+/// Why the callback produced nothing, when it produced nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct IoStats {
+    /// Times Core Audio invoked the IOProc. Zero means the block was never
+    /// registered or the device never started -- not a data problem at all.
+    pub calls: u64,
+    /// Cycles dropped because `mNumberBuffers` disagreed with the stream layout
+    /// discovered in `start()`.
+    pub shape_mismatch: u64,
+    /// Cycles where every buffer was empty or null.
+    pub empty: u64,
+    /// `mNumberBuffers` last seen, for comparison against `expected_n_buffers`.
+    pub last_n_buffers: u64,
+    /// What the callback expects, fixed at `start()`.
+    pub expected_n_buffers: u64,
+}
+
+pub fn io_stats() -> IoStats {
+    IoStats {
+        calls: IOPROC_CALLS.load(Ordering::Relaxed),
+        shape_mismatch: SHAPE_MISMATCH.load(Ordering::Relaxed),
+        empty: EMPTY_CYCLES.load(Ordering::Relaxed),
+        last_n_buffers: LAST_N_BUFFERS.load(Ordering::Relaxed),
+        expected_n_buffers: EXPECTED_N_BUFFERS.load(Ordering::Relaxed),
+    }
 }
 
 /// Aggregate devices with more legs than this are refused rather than
@@ -314,6 +355,8 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
         system_channels: (mic_channels_total as u16, channels - 1),
     };
 
+    EXPECTED_N_BUFFERS.store(stream_channels.len() as u64, Ordering::Relaxed);
+
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_samples);
     let producer_cell = UnsafeCell::new(producer);
 
@@ -333,10 +376,14 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
                 // with itself (one call in flight at a time, even across
                 // dispatch-queue thread hops), so this is never aliased.
                 let producer = unsafe { &mut *producer_cell.get() };
+                IOPROC_CALLS.fetch_add(1, Ordering::Relaxed);
                 let list = unsafe { in_data.as_ref() };
                 let n_buffers = list.mNumberBuffers as usize;
+                LAST_N_BUFFERS.store(n_buffers as u64, Ordering::Relaxed);
                 if n_buffers != stream_channels.len() {
-                    return; // stream shape changed since start(); drop this cycle.
+                    // stream shape changed since start(); drop this cycle.
+                    SHAPE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
                 // AudioBufferList is a C flexible-array-member struct: the
                 // Rust binding only declares `mBuffers: [AudioBuffer; 1]`,
@@ -369,6 +416,7 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
                     );
                 }
                 if min_frames == 0 {
+                    EMPTY_CYCLES.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
 
@@ -406,6 +454,14 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
         )
     };
     check(status, "AudioDeviceCreateIOProcIDWithBlock")?;
+    // noErr with a null ID would mean AudioDeviceStart starts the device with no
+    // IOProc attached: a running aggregate that never calls us, indistinguishable
+    // from the macOS 26 nil-queue no-op. Refuse it here rather than debug it there.
+    if io_proc_id.is_none() {
+        return Err(anyhow!(
+            "AudioDeviceCreateIOProcIDWithBlock returned success but no IOProc ID"
+        ));
+    }
     guard.io_proc = Some((aggregate_id, io_proc_id));
 
     let status = unsafe { AudioDeviceStart(aggregate_id, io_proc_id) };

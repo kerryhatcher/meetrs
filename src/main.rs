@@ -7,6 +7,7 @@
 
 mod capture;
 mod chunk;
+mod compress;
 mod db;
 mod lock;
 mod model;
@@ -134,13 +135,47 @@ fn main() -> Result<()> {
         summary.chunks,
         summary.total.as_secs_f32()
     );
-    match asr.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("transcription ended early: {e:#}"),
-        Err(_) => eprintln!("transcription thread panicked; audio is still intact"),
+    let transcribed_cleanly = match asr.join() {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            eprintln!("transcription ended early: {e:#}");
+            false
+        }
+        Err(_) => {
+            eprintln!("transcription thread panicked; audio is still intact");
+            false
+        }
+    };
+
+    // Compress only what has actually been transcribed. If transcription bailed
+    // out, some chunk may still need its float WAV for a retry, so the audio
+    // stays exactly as recorded.
+    if transcribed_cleanly {
+        compress_session(&dir);
+    } else {
+        eprintln!("skipping compression: chunks may still need re-transcribing");
     }
+
     println!("{}", dir.display());
     Ok(())
+}
+
+/// Shrink the session's WAVs to FLAC. Recording and transcription are already
+/// done and durable by this point, so nothing here is worth failing over — a
+/// problem costs disk space, never audio.
+fn compress_session(dir: &std::path::Path) {
+    let mut warn = |msg: String| eprintln!("meetrs: {msg}");
+    match compress::run(dir, &mut warn) {
+        Ok(s) if s.files > 0 => println!(
+            "compressed {} chunk(s) to FLAC: {:.1} MB → {:.1} MB ({:.0}% smaller)",
+            s.files,
+            s.before as f64 / 1e6,
+            s.after as f64 / 1e6,
+            s.percent_saved()
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("meetrs: compression skipped: {e:#}"),
+    }
 }
 
 /// Small helper the UI uses to bound its redraw rate.

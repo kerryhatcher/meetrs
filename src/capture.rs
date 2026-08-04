@@ -3,7 +3,8 @@
 //! One aggregate device = one global process tap (system audio, excluding our
 //! own process to avoid feedback) + the default input device (mic), with
 //! drift compensation on both legs. One IOProc on that aggregate means Core
-//! Audio does the clock sync for us. See docs/research/rust-audio-macos.md
+//! Audio does the clock sync for us. See docs/research/rust-audio-macos.md,
+//! which lives in git history rather than the working tree
 //! for the sourcing behind every non-obvious choice below (isExclusive
 //! inversion, mandatory dispatch queue, tap-only-aggregate zero-samples risk).
 //!
@@ -498,7 +499,7 @@ fn validate_stream_format(format: &AudioStreamBasicDescription) -> Result<()> {
     if !packed_float32 {
         return Err(anyhow!(
             "input stream format isn't packed float32 (flags {:#x}, {} bits/channel) \
-             -- unsupported layout, see docs/research/rust-audio-macos.md",
+             -- unsupported layout, see docs/research/rust-audio-macos.md in git history",
             flags,
             format.mBitsPerChannel
         ));

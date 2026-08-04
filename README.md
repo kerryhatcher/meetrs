@@ -13,7 +13,8 @@ so it will happily fill your disk.
 ## Install
 
 macOS 14.4+ (that floor is a Core Audio process-tap requirement, not arbitrary —
-see [`docs/research/rust-audio-macos.md`](docs/research/rust-audio-macos.md)).
+see `docs/research/rust-audio-macos.md`, kept in git history rather than the
+working tree: `git show 3212d62:docs/research/rust-audio-macos.md`).
 
 ```sh
 cargo build --release
@@ -134,7 +135,8 @@ yourself.
 
 ## Known limitations
 
-- **macOS only.** `docs/research/rust-audio-linux.md` has the PipeWire plan.
+- **macOS only.** The PipeWire plan is in `docs/research/rust-audio-linux.md`,
+  in git history (`git show 3212d62:docs/research/rust-audio-linux.md`).
 - **No grooming.** Nothing is ever deleted. This will fill your disk.
 - **Continuous system audio suppresses chunk splits.** A chunk stays open while
   either leg has speech, so background music or a playing video holds one chunk
@@ -163,7 +165,8 @@ yourself.
 - **The zero-samples bug is not fully ruled out.** Core Audio process taps have a
   documented failure mode where the tap looks healthy and delivers pure silence.
   If a recording comes back quiet, that's the first suspect — details and the
-  three known root causes are in `docs/research/rust-audio-macos.md`.
+  three known root causes are in `docs/research/rust-audio-macos.md`, in git
+  history (`git show 3212d62:docs/research/rust-audio-macos.md`).
 
 ## License
 

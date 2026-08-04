@@ -348,7 +348,7 @@ fn check() -> Result<()> {
         println!(
             "\nWARNING: system leg is bit-exact zero across {frames} frames.\n\
              That is the signature of the process-tap zero-samples bug, not quiet audio.\n\
-             See docs/research/rust-audio-macos.md"
+             See docs/research/rust-audio-macos.md in git history"
         );
     }
     Ok(())

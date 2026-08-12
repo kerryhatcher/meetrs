@@ -731,4 +731,68 @@ mod tests {
         assert_eq!(out[0].end_secs, 63.5);
         assert_eq!(out[0].leg, "mic");
     }
+
+    /// Not run by `cargo test`: needs the 465 MiB model and gitignored fixture
+    /// audio. Run it deliberately:
+    ///   cargo test --release fixture_chunk -- --ignored --nocapture
+    /// The assertions catch wiring bugs; the printed transcript is for a human
+    /// to judge whether the turn boundaries land in sensible places.
+    #[test]
+    #[ignore = "needs the tdrz model and gitignored fixture audio"]
+    fn fixture_chunk_gets_monotonic_turn_labels() {
+        let dir = PathBuf::from("fixtures/2026-08-12T15-53-14");
+        assert!(
+            dir.join("meta.json").is_file(),
+            "fixtures missing; see the spec for which chunks to copy"
+        );
+        let meta = load_session_meta(&dir).unwrap();
+        let model = crate::model::ensure(|_, _| {}).unwrap();
+        let tdrz = model_supports_tdrz(&model);
+        assert!(tdrz, "expected a tdrz model, got {}", model.display());
+
+        let ctx =
+            WhisperContext::new_with_params(&model, WhisperContextParameters::default()).unwrap();
+
+        // chunk-139 is system-leg only and densely multi-speaker: the case tdrz
+        // is actually for. chunk-209 is mic-only, standing in for in-person.
+        for index in [139u32, 209] {
+            let job = Job {
+                path: dir.join(format!("chunk-{index:03}.wav")),
+                index,
+                offset: Duration::ZERO,
+            };
+            let processed = process_job(&ctx, &job, &meta, tdrz).unwrap();
+            println!("\n=== chunk-{index:03} ===");
+            for seg in &processed.segments {
+                println!(
+                    "[{}] {}: {}",
+                    fmt_timestamp(seg.start_secs),
+                    speaker_label(seg.leg, seg.turn),
+                    seg.text
+                );
+            }
+            assert!(
+                !processed.segments.is_empty(),
+                "chunk-{index:03} produced no segments"
+            );
+
+            // Per leg, not across the whole chunk: process_job sorts segments by
+            // start_secs, and the two legs number independently, so an
+            // interleaved sequence legitimately reads mic/T4 then system/T1.
+            for leg in ["mic", "system"] {
+                let mut last: Option<u32> = None;
+                for seg in processed.segments.iter().filter(|s| s.leg == leg) {
+                    let turn = seg.turn.expect("a tdrz model must number every turn");
+                    assert!(turn >= 1, "turns are 1-based, got {turn}");
+                    if let Some(prev) = last {
+                        assert!(
+                            turn >= prev,
+                            "{leg} turns went backwards: {prev} then {turn}"
+                        );
+                    }
+                    last = Some(turn);
+                }
+            }
+        }
+    }
 }

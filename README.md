@@ -22,6 +22,16 @@ cargo build --release
 ./target/release/meetrs.app/Contents/MacOS/meetrs
 ```
 
+First run downloads the transcription model (`ggml-small.en-tdrz.bin`, 465 MiB)
+to `~/.meetrs/models/`. It is the tinydiarize fine-tune of `small.en` — the only
+published Whisper model that marks speaker turns, which is why it is unquantized
+and eight times the size of a plain `base.en`. Set `MEETRS_MODEL` to use a model
+you already have; transcripts then simply carry no `T` numbers.
+
+Upgrading from an earlier version leaves the superseded `ggml-base.en-q5_1.bin`
+in that directory. meetrs grooms nothing, so delete it yourself if you want the
+57 MiB back.
+
 The `.app` wrapper is not optional. macOS gates audio capture behind TCC consent,
 consent requires the `NSAudioCaptureUsageDescription` and
 `NSMicrophoneUsageDescription` keys in an `Info.plist`, and a bare binary has no

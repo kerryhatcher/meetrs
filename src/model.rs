@@ -19,11 +19,17 @@ use crate::types::models_dir;
 /// will use it verbatim and never hit the network.
 pub const MODEL_ENV: &str = "MEETRS_MODEL";
 
-const FILENAME: &str = "ggml-base.en-q5_1.bin";
-const URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin";
-/// Verified 2026-08-03: matches both the git-lfs `oid` HuggingFace's API
-/// reports for this file and the sha256sum of a full downloaded copy.
-const SHA256: &str = "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f";
+const FILENAME: &str = "ggml-small.en-tdrz.bin";
+const URL: &str =
+    "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml-small.en-tdrz.bin";
+/// Verified 2026-08-12: matches the git-lfs `oid` HuggingFace's API reports for
+/// this file (487,614,184 bytes).
+///
+/// This is the tinydiarize fine-tune of small.en, and it is the only published
+/// model that emits speaker-turn tokens. It lives in akashmjn's repo rather than
+/// ggerganov/whisper.cpp, which does not host it, and no quantized variant
+/// exists — hence 465 MiB rather than the 57 MiB of the base.en-q5_1 it replaces.
+const SHA256: &str = "ceac3ec06d1d98ef71aec665283564631055fd6129b79d8e1be4f9cc33cc54b4";
 
 /// Path to a ready-to-use Whisper model, downloading it on first run.
 /// `progress` is called with (bytes_so_far, total_bytes_or_0) during download.

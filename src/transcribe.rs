@@ -174,6 +174,18 @@ fn number_turns(
     out
 }
 
+/// Whether this model can emit tinydiarize speaker-turn tokens.
+///
+/// GGML files carry no capability metadata, and `tdrz_enable` on a model that
+/// was never trained to emit token 50359 simply un-suppresses a token that then
+/// never fires — every segment would land in T1, which is worse than admitting
+/// we do not know. Keyed on the filename, same as whisper.cpp's own tooling.
+fn model_supports_tdrz(model: &Path) -> bool {
+    model
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains("tdrz"))
+}
+
 fn whisper_threads() -> i32 {
     // Leave at least one core for the audio callback + writer thread — an
     // overrun there is far worse than transcription running a bit slower.
@@ -188,6 +200,12 @@ fn full_params() -> FullParams<'static, 'static> {
     params.set_n_threads(whisper_threads());
     params.set_language(Some("en"));
     params.set_translate(false);
+    // Stops whisper.cpp suppressing token 50359 ([_SOLM_]) at -INFINITY. Safe to
+    // set unconditionally: on a non-tdrz model the token is untrained and never
+    // fires, and `model_supports_tdrz` is what decides whether we believe it.
+    // The token sits above token_eot, so with set_print_special(false) below it
+    // never leaks into segment text.
+    params.set_tdrz_enable(true);
     // These would corrupt the TUI by writing straight to stdout/stderr.
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -341,6 +359,19 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
     let ctx = WhisperContext::new_with_params(&model, WhisperContextParameters::default())
         .context("loading whisper model")?;
 
+    // Once per session, not per chunk: MEETRS_MODEL is a real escape hatch and
+    // pointing it at a non-tdrz model must degrade to unlabelled turns rather
+    // than to a wrong T1 on every segment.
+    let tdrz_available = model_supports_tdrz(&model);
+    if !tdrz_available {
+        let _ = tx.send(Status::Warning(format!(
+            "{} cannot detect speaker turns; transcripts will have no T-numbers. \
+             Unset {} to use the default tinydiarize model.",
+            model.display(),
+            crate::model::MODEL_ENV
+        )));
+    }
+
     let mut meta: Option<SessionMeta> = None;
     let mut transcript_md = String::new();
     let mut queue: VecDeque<Job> = VecDeque::new();
@@ -380,8 +411,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
             },
         };
 
-        // Task 4 replaces this with real tdrz capability detection.
-        match process_job(&ctx, &job, session_meta, false) {
+        match process_job(&ctx, &job, session_meta, tdrz_available) {
             Ok(processed) => {
                 let took = started.elapsed();
                 let chunk_json = ChunkTranscript {
@@ -666,6 +696,26 @@ mod tests {
     #[test]
     fn number_turns_on_empty_input_is_empty() {
         assert!(number_turns(Vec::new(), "mic", Duration::ZERO, true).is_empty());
+    }
+
+    #[test]
+    fn tdrz_support_is_detected_from_the_model_filename() {
+        // There is no API to ask a GGML model whether it was trained to emit the
+        // turn token, so the filename is the only signal — which is exactly what
+        // whisper.cpp's own download tooling keys on.
+        assert!(model_supports_tdrz(Path::new(
+            "/Users/x/.meetrs/models/ggml-small.en-tdrz.bin"
+        )));
+        assert!(!model_supports_tdrz(Path::new(
+            "/Users/x/.meetrs/models/ggml-base.en-q5_1.bin"
+        )));
+    }
+
+    #[test]
+    fn tdrz_detection_ignores_directories_above_the_file() {
+        // A user whose model cache happens to sit under a "tdrz" directory must
+        // not get turn labels from a model that cannot produce them.
+        assert!(!model_supports_tdrz(Path::new("/tdrz/ggml-base.en.bin")));
     }
 
     #[test]

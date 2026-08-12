@@ -25,6 +25,11 @@ bundle: build
     if [ ! -e "{{exe}}" ] || [ "{{bin}}" -nt "{{exe}}" ]; then
         ./scripts/bundle.sh {{profile}}
     fi
+    # An up-to-date bundle can still predate `just signing-cert`, and `run`/`check`
+    # exec *this* copy rather than the installed one — so it has to carry the same
+    # identity, or TCC consent ends up split between two of them. --if-needed makes
+    # this a no-op once it matches.
+    ./scripts/sign.sh --if-needed "{{app}}"
 
 # build, bundle if needed, and launch the TUI recorder
 run: bundle
@@ -63,9 +68,10 @@ install: bundle
     mkdir -p "{{appdir}}" "{{bindir}}"
     rm -rf "$dest"
     cp -R "{{app}}" "$dest"
-    # Re-sign after the copy so the installed bundle's ad-hoc signature covers
-    # the files at their final path.
-    codesign -s - -f "$dest" >/dev/null 2>&1
+    # Re-sign after the copy so the installed bundle's signature covers the files
+    # at their final path. Same helper as bundle.sh, so the two cannot drift onto
+    # different identities and split the TCC grant between them.
+    ./scripts/sign.sh "$dest" >/dev/null
     ln -sfn "$dest/Contents/MacOS/meetrs" "$link"
 
     echo "installed $dest"
@@ -83,6 +89,11 @@ install: bundle
         echo "NOTE: ~/.cargo/bin/meetrs is a bare binary and cannot get audio consent."
         echo "      Remove it so it can never shadow this install:  cargo uninstall meetrs"
     fi
+
+# create this machine's local signing identity so audio consent survives
+# rebuilds (once per machine; see scripts/sign.sh for why)
+signing-cert:
+    ./scripts/signing-cert.sh
 
 # run the test suite
 test:

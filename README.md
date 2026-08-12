@@ -26,8 +26,19 @@ The `.app` wrapper is not optional. macOS gates audio capture behind TCC consent
 consent requires the `NSAudioCaptureUsageDescription` and
 `NSMicrophoneUsageDescription` keys in an `Info.plist`, and a bare binary has no
 `Info.plist` — so an unbundled build is never even prompted, and capture fails
-without telling you why. TCC also keys consent to the code-signing identity, so
-`bundle.sh` ad-hoc signs the result.
+without telling you why.
+
+TCC also keys consent to the *code-signing identity*, and ad-hoc signing has no
+certificate to key to — the grant gets pinned to that exact build instead, so
+every rebuild silently revokes it (`Failed to match existing code requirement` in
+tccd's log). One self-signed identity, created once, fixes that permanently:
+
+```sh
+just signing-cert   # stays on this machine; then re-run: just install
+```
+
+Skipping it costs nothing but convenience: capture still works, you just
+re-approve the prompts after every rebuild.
 
 On first run, macOS will ask for microphone and system-audio-recording consent.
 Grant both, then **fully quit and relaunch** — a screen/audio-recording grant does

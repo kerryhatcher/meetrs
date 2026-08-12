@@ -40,8 +40,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # TCC keys consent to the code-signing identity, so an unsigned build is never
-# even prompted. Ad-hoc is enough for local dev; shipping needs a Developer ID.
-codesign -s - -f "$APP" >/dev/null 2>&1
+# even prompted — and an ad-hoc one is re-prompted on every rebuild. sign.sh
+# prefers the stable local identity and explains the fallback.
+"$ROOT/scripts/sign.sh" "$APP" >/dev/null
 
 echo "built $APP"
 echo "run it from a terminal so the TUI gets a pty:"

@@ -10,6 +10,8 @@ exe := app + "/Contents/MacOS/meetrs"
 # to it, so it needs a stable home outside target/); bindir holds the PATH entry.
 appdir := env("MEETRS_APPDIR", "$HOME/Applications")
 bindir := env("MEETRS_BINDIR", "$HOME/.local/bin")
+installed := appdir + "/meetrs.app"
+installed_exe := installed + "/Contents/MacOS/meetrs"
 
 # list available recipes
 default:
@@ -25,15 +27,21 @@ bundle: build
     if [ ! -e "{{exe}}" ] || [ "{{bin}}" -nt "{{exe}}" ]; then
         ./scripts/bundle.sh {{profile}}
     fi
-    # An up-to-date bundle can still predate `just signing-cert`, and `run`/`check`
+    # An up-to-date bundle can still predate `just signing-cert`, and `check`/`search`
     # exec *this* copy rather than the installed one — so it has to carry the same
     # identity, or TCC consent ends up split between two of them. --if-needed makes
     # this a no-op once it matches.
     ./scripts/sign.sh --if-needed "{{app}}"
 
-# build, bundle if needed, and launch the TUI recorder
-run: bundle
-    exec "{{exe}}"
+# build, install, and launch the TUI recorder
+#
+# Deliberately runs the *installed* bundle rather than target/: that is the copy
+# System Settings lists and attaches consent to, and it lives at a stable path, so
+# launching it is the configuration that was actually granted. meetrs preflights
+# capture itself before taking the screen, and refuses to start a session that
+# would provably record nothing.
+run: install
+    exec "{{installed_exe}}"
 
 # build, bundle if needed, and run headless calibration (sets MEETRS_SILENCE_RMS)
 check: bundle
@@ -58,7 +66,7 @@ compress *DIRS: bundle
 install: bundle
     #!/usr/bin/env bash
     set -euo pipefail
-    dest="{{appdir}}/meetrs.app"
+    dest="{{installed}}"
     link="{{bindir}}/meetrs"
 
     # The PATH entry is a symlink INTO the bundle, not a copy of the binary.
@@ -66,15 +74,30 @@ install: bundle
     # bare binary on PATH (what `cargo install` produces) can never be granted
     # microphone or system-audio access — see scripts/bundle.sh.
     mkdir -p "{{appdir}}" "{{bindir}}"
-    rm -rf "$dest"
-    cp -R "{{app}}" "$dest"
-    # Re-sign after the copy so the installed bundle's signature covers the files
-    # at their final path. Same helper as bundle.sh, so the two cannot drift onto
-    # different identities and split the TCC grant between them.
-    ./scripts/sign.sh "$dest" >/dev/null
-    ln -sfn "$dest/Contents/MacOS/meetrs" "$link"
 
-    echo "installed $dest"
+    # `just run` installs on every launch, so do nothing when nothing changed:
+    # writing a fresh 6MB binary can stall for many seconds behind on-access
+    # antivirus, which would otherwise be added to every single launch.
+    #
+    # Compared by CDHash, not by `cmp`: re-signing the copy below rewrites the CMS
+    # blob, so the installed file is never byte-identical to the source even when
+    # nothing changed. The CDHash covers the sealed content (executable, plist,
+    # identifier) and not that blob, so it is stable across a re-sign and is what
+    # actually answers "is the installed bundle this build?".
+    cdhash() { codesign -dvvv "$1" 2>&1 | awk -F= '/^CDHash/ { print $2 }'; }
+    built="$(cdhash "{{app}}")"
+    if [ -n "$built" ] && [ "$built" = "$(cdhash "$dest")" ]; then
+        echo "up to date $dest"
+    else
+        rm -rf "$dest"
+        cp -R "{{app}}" "$dest"
+        # Re-sign after the copy so the installed bundle's signature covers the
+        # files at their final path. Same helper as bundle.sh, so the two cannot
+        # drift onto different identities and split the TCC grant between them.
+        ./scripts/sign.sh "$dest" >/dev/null
+        echo "installed $dest"
+    fi
+    ln -sfn "{{installed_exe}}" "$link"
     echo "linked    $link"
 
     case ":$PATH:" in

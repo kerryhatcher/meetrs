@@ -102,10 +102,23 @@ fn main() -> Result<()> {
         );
     }
 
-    let (info, consumer) = capture::start(RING_SAMPLES).context(
+    let (info, mut consumer) = capture::start(RING_SAMPLES).context(
         "starting audio capture — if this is a permissions failure, see the README \
          section on TCC consent and codesigning",
     )?;
+
+    // Before the TUI takes the screen, while errors are still readable: confirm
+    // this session will actually capture something. Non-destructive, so the
+    // recording still starts at t=0.
+    if let Err(e) = preflight(&mut consumer, info) {
+        // Tear the aggregate device back down and take the session directory with
+        // it: nothing was recorded, and a refused launch should not leave an empty
+        // directory behind every time. `remove_dir` only removes it when empty, so
+        // this can never discard audio.
+        capture::stop();
+        let _ = std::fs::remove_dir(&dir);
+        return Err(e);
+    }
 
     let (tx, rx) = mpsc::channel();
     // Chunks are queued here the moment they are fsynced, so transcription of
@@ -306,6 +319,140 @@ fn fmt_hms(secs: f64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+/// How long the launch preflight watches the stream. Long enough to see audio
+/// flowing, short enough not to feel like a stall when nothing is playing.
+const PREFLIGHT_WINDOW: Duration = Duration::from_millis(1000);
+
+/// What the opening moments of the stream looked like, per leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Opening {
+    frames: usize,
+    mic_signal: bool,
+    system_signal: bool,
+}
+
+/// Classify interleaved samples by leg, counting a leg as live once any sample on
+/// it is non-zero. Bit-exact zero is the signal here: a denied mic or a refused
+/// tap both deliver *digital* silence, which a real microphone never does.
+fn summarize<'a>(samples: impl Iterator<Item = &'a f32>, info: types::CaptureInfo) -> Opening {
+    let channels = info.channels as usize;
+    let mut opening = Opening {
+        frames: 0,
+        mic_signal: false,
+        system_signal: false,
+    };
+    let mut count = 0usize;
+    for (i, sample) in samples.enumerate() {
+        count = i + 1;
+        if *sample == 0.0 {
+            continue;
+        }
+        let channel = (i % channels) as u16;
+        if channel >= info.mic_channels.0 && channel <= info.mic_channels.1 {
+            opening.mic_signal = true;
+        } else if channel >= info.system_channels.0 && channel <= info.system_channels.1 {
+            opening.system_signal = true;
+        }
+    }
+    opening.frames = count / channels;
+    opening
+}
+
+/// Watch the start of the stream *without consuming it*, so the recording still
+/// contains everything from t=0. Returns as soon as both legs have shown signal,
+/// or when the window closes.
+fn observe_opening(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Opening {
+    let channels = info.channels as usize;
+    let deadline = std::time::Instant::now() + PREFLIGHT_WINDOW;
+    let mut opening = Opening {
+        frames: 0,
+        mic_signal: false,
+        system_signal: false,
+    };
+    while std::time::Instant::now() < deadline {
+        let frames = consumer.slots() / channels;
+        if frames > 0 {
+            // Re-read from the same position every pass: a ReadChunk that is
+            // dropped without commit()/commit_all() leaves the data in the ring,
+            // so the writer thread still gets these samples (see tests).
+            if let Ok(chunk) = consumer.read_chunk(frames * channels) {
+                let (a, b) = chunk.as_slices();
+                opening = summarize(a.iter().chain(b.iter()), info);
+                if opening.mic_signal && opening.system_signal {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    opening
+}
+
+/// Refuse to start a recording that is provably going to capture nothing, and
+/// warn where the cause is genuinely ambiguous.
+///
+/// The ambiguity is unavoidable and worth spelling out: the aggregate is
+/// tap-driven, so before a meeting starts — nothing playing — no callbacks arrive
+/// at all, which looks identical to a refused tap. Aborting on that would make
+/// meetrs impossible to launch *ahead* of a meeting, which is when you want it.
+/// So only the provable cases abort.
+fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Result<()> {
+    // The failure this exists to catch: with TCC attributing us to the terminal,
+    // the tap is refused and the whole session is silence. Always fatal, and
+    // cheap to check — no waiting on audio. See src/tcc.rs.
+    if let Some((pid, path)) = tcc::foreign_responsible_process() {
+        anyhow::bail!(
+            "TCC is attributing this process to {} (pid {}) rather than to meetrs, so \
+             system audio will be refused and the recording would be silent.\n\
+             Run the installed bundle (`just install`, then `meetrs`) so meetrs is its \
+             own subject.",
+            path.display(),
+            pid
+        );
+    }
+
+    let opening = observe_opening(consumer, info);
+
+    if opening.frames > 0 && !opening.mic_signal && !opening.system_signal {
+        anyhow::bail!(
+            "capture is running but every sample on both legs is bit-exact zero, so this \
+             recording would contain nothing.\n\
+             A real microphone never delivers digital silence: consent was denied, or the \
+             mic is muted. Check System Settings > Privacy & Security > Microphone and \
+             Screen & System Audio Recording, then run `just check` with audio playing."
+        );
+    }
+
+    let warning = if opening.frames == 0 {
+        Some(
+            "no audio arrived in the first second. The tap only runs while some process \
+             writes system audio, so this is expected before a meeting starts — but it \
+             also looks exactly like a refused tap. `just check` with audio playing tells \
+             them apart.",
+        )
+    } else if !opening.mic_signal {
+        Some(
+            "the microphone leg is bit-exact zero while system audio flows — the mic is \
+             muted or its consent was denied. System audio will still be recorded.",
+        )
+    } else if !opening.system_signal {
+        Some(
+            "system audio is bit-exact zero while the mic flows. Expected if nothing is \
+             playing yet; otherwise the tap was refused.",
+        )
+    } else {
+        None
+    };
+
+    if let Some(warning) = warning {
+        eprintln!("meetrs: {warning}");
+        // The TUI clears the screen the instant it starts, so a warning printed
+        // and immediately painted over is a warning nobody reads.
+        std::thread::sleep(Duration::from_millis(2500));
+    }
+    Ok(())
+}
+
 /// `--check`: capture for a few seconds and report the negotiated layout plus
 /// per-leg signal level, then exit. No TUI, so it runs without a tty.
 ///
@@ -433,5 +580,86 @@ fn attribution_note() -> String {
             pid
         ),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Opening, summarize};
+    use crate::types::CaptureInfo;
+
+    /// 1 mic channel + 2 system channels, the layout this machine negotiates.
+    fn info() -> CaptureInfo {
+        CaptureInfo {
+            channels: 3,
+            sample_rate: 48_000,
+            mic_channels: (0, 0),
+            system_channels: (1, 2),
+        }
+    }
+
+    #[test]
+    fn digital_silence_shows_no_signal_on_either_leg() {
+        let samples = [0.0f32; 3 * 10];
+        assert_eq!(
+            summarize(samples.iter(), info()),
+            Opening {
+                frames: 10,
+                mic_signal: false,
+                system_signal: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_mic_with_a_refused_tap_is_told_apart() {
+        // channel 0 (mic) has signal, channels 1-2 (tap) are bit-exact zero:
+        // exactly the shape a denied process tap produces.
+        let samples: Vec<f32> = (0..10).flat_map(|_| [0.02, 0.0, 0.0]).collect();
+        let opening = summarize(samples.iter(), info());
+        assert_eq!(opening.frames, 10);
+        assert!(opening.mic_signal);
+        assert!(!opening.system_signal);
+    }
+
+    #[test]
+    fn a_muted_mic_with_live_system_audio_is_told_apart() {
+        let samples: Vec<f32> = (0..10).flat_map(|_| [0.0, -0.3, 0.4]).collect();
+        let opening = summarize(samples.iter(), info());
+        assert!(!opening.mic_signal);
+        assert!(opening.system_signal);
+    }
+
+    #[test]
+    fn a_partial_trailing_frame_is_not_counted() {
+        // 3 whole frames plus one stray sample.
+        let samples = [0.1f32; 3 * 3 + 1];
+        assert_eq!(summarize(samples.iter(), info()).frames, 3);
+    }
+
+    /// The preflight reads the ring buffer and deliberately does not commit, so
+    /// that the writer thread still receives the opening samples. That only holds
+    /// because an uncommitted `ReadChunk` leaves the data in place — if rtrb ever
+    /// changed that, the recording would silently lose its first second.
+    #[test]
+    fn reading_a_chunk_without_committing_consumes_nothing() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(16);
+        for i in 0..9 {
+            producer.push(i as f32).unwrap();
+        }
+        assert_eq!(consumer.slots(), 9);
+
+        {
+            let chunk = consumer.read_chunk(9).unwrap();
+            let (a, b) = chunk.as_slices();
+            assert_eq!(a.iter().chain(b.iter()).count(), 9);
+            // dropped here, uncommitted
+        }
+        assert_eq!(consumer.slots(), 9, "uncommitted read must not consume");
+
+        // And committing still works afterwards, so the writer is unaffected.
+        let chunk = consumer.read_chunk(9).unwrap();
+        chunk.commit_all();
+        assert_eq!(consumer.slots(), 0);
     }
 }

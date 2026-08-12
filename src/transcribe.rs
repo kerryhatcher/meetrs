@@ -83,6 +83,9 @@ struct SegmentOut {
     end_secs: f64,
     text: String,
     no_speech_prob: f32,
+    /// Chunk-local, per-leg speaker turn, 1-based. `None` when the model cannot
+    /// diarize. Never compare across chunks or legs.
+    turn: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -113,12 +116,62 @@ fn session_relative_secs(offset: Duration, chunk_local_secs: f64) -> f64 {
 /// Turn numbers are chunk-local and per-leg — `system/T1` in chunk 3 is not the
 /// same person as `system/T1` in chunk 4. Collapsing turns into stable speakers
 /// needs embeddings and is deliberately out of scope here.
-#[allow(dead_code)]
 pub(crate) fn speaker_label(leg: &str, turn: Option<u32>) -> String {
     match turn {
         Some(n) => format!("{leg}/T{n}"),
         None => leg.to_string(),
     }
+}
+
+/// One segment exactly as whisper reported it, before filtering or numbering.
+/// Exists so the numbering logic is a pure function over plain data —
+/// `WhisperSegment` cannot be constructed outside whisper-rs, so testing
+/// against it directly is impossible.
+struct RawSegment {
+    text: String,
+    /// Whisper's chunk-relative timestamps, in centiseconds.
+    start_cs: i64,
+    end_cs: i64,
+    no_speech_prob: f32,
+    /// tinydiarize predicted a speaker change *after* this segment.
+    turn_flag: bool,
+}
+
+/// Drops non-speech segments and assigns monotonic, chunk-local turn numbers.
+///
+/// Monotonic rather than alternating on purpose: tdrz only establishes that turn
+/// N differs from turn N+1. Whether turn 3 returns to turn 1's speaker is
+/// unknowable here, and `S1/S2` alternation would assert a two-speaker
+/// conversation that is false in any larger meeting.
+fn number_turns(
+    raws: Vec<RawSegment>,
+    leg: &'static str,
+    offset: Duration,
+    tdrz_available: bool,
+) -> Vec<SegmentOut> {
+    let mut out = Vec::with_capacity(raws.len());
+    let mut turn = 1u32;
+    for raw in raws {
+        // Whisper emits bracketed non-speech markers for silence. One leg is
+        // quiet in most chunks (nobody talks over the whole meeting), so without
+        // this the transcript is mostly "[BLANK_AUDIO]".
+        if !is_non_speech_marker(&raw.text) {
+            out.push(SegmentOut {
+                leg,
+                start_secs: session_relative_secs(offset, raw.start_cs as f64 * 0.01),
+                end_secs: session_relative_secs(offset, raw.end_cs as f64 * 0.01),
+                text: raw.text,
+                no_speech_prob: raw.no_speech_prob,
+                turn: tdrz_available.then_some(turn),
+            });
+        }
+        // Outside the filter: a boundary flagged on a dropped marker is still a
+        // real boundary, and incrementing inside would silently lose it.
+        if raw.turn_flag {
+            turn += 1;
+        }
+    }
+    out
 }
 
 fn whisper_threads() -> i32 {
@@ -149,6 +202,7 @@ fn transcribe_leg(
     mono_16k: &[f32],
     leg: &'static str,
     offset: Duration,
+    tdrz_available: bool,
 ) -> Result<Vec<SegmentOut>> {
     if mono_16k.is_empty() {
         return Ok(Vec::new());
@@ -159,30 +213,20 @@ fn transcribe_leg(
         .context("running whisper full()")?;
 
     let n = state.full_n_segments();
-    let mut out = Vec::with_capacity(n as usize);
+    let mut raws = Vec::with_capacity(n as usize);
     for i in 0..n {
         let Some(seg) = state.get_segment(i) else {
             continue;
         };
-        let text = seg.to_str_lossy().unwrap_or_default().trim().to_string();
-        // Whisper emits bracketed non-speech markers for silence. One leg is
-        // quiet in most chunks (nobody talks over the whole meeting), so without
-        // this the transcript is mostly "[BLANK_AUDIO]".
-        if is_non_speech_marker(&text) {
-            continue;
-        }
-        // Timestamps are centiseconds (10ms units).
-        let start = session_relative_secs(offset, seg.start_timestamp() as f64 * 0.01);
-        let end = session_relative_secs(offset, seg.end_timestamp() as f64 * 0.01);
-        out.push(SegmentOut {
-            leg,
-            start_secs: start,
-            end_secs: end,
-            text,
+        raws.push(RawSegment {
+            text: seg.to_str_lossy().unwrap_or_default().trim().to_string(),
+            start_cs: seg.start_timestamp(),
+            end_cs: seg.end_timestamp(),
             no_speech_prob: seg.no_speech_probability(),
+            turn_flag: seg.next_segment_speaker_turn(),
         });
     }
-    Ok(out)
+    Ok(number_turns(raws, leg, offset, tdrz_available))
 }
 
 /// True for empty text and for whisper's bracketed/parenthesised non-speech
@@ -211,7 +255,12 @@ struct Processed {
     words: usize,
 }
 
-fn process_job(ctx: &WhisperContext, job: &Job, meta: &SessionMeta) -> Result<Processed> {
+fn process_job(
+    ctx: &WhisperContext,
+    job: &Job,
+    meta: &SessionMeta,
+    tdrz_available: bool,
+) -> Result<Processed> {
     let mut reader = hound::WavReader::open(&job.path).context("opening chunk wav")?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
@@ -227,8 +276,14 @@ fn process_job(ctx: &WhisperContext, job: &Job, meta: &SessionMeta) -> Result<Pr
     let mic_16k = resample_to_whisper_rate(&mic_mono, spec.sample_rate)?;
     let sys_16k = resample_to_whisper_rate(&sys_mono, spec.sample_rate)?;
 
-    let mut segments = transcribe_leg(ctx, &mic_16k, "mic", job.offset)?;
-    segments.extend(transcribe_leg(ctx, &sys_16k, "system", job.offset)?);
+    let mut segments = transcribe_leg(ctx, &mic_16k, "mic", job.offset, tdrz_available)?;
+    segments.extend(transcribe_leg(
+        ctx,
+        &sys_16k,
+        "system",
+        job.offset,
+        tdrz_available,
+    )?);
     segments.sort_by(|a, b| a.start_secs.total_cmp(&b.start_secs));
 
     let words = segments
@@ -325,7 +380,8 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
             },
         };
 
-        match process_job(&ctx, &job, session_meta) {
+        // Task 4 replaces this with real tdrz capability detection.
+        match process_job(&ctx, &job, session_meta, false) {
             Ok(processed) => {
                 let took = started.elapsed();
                 let chunk_json = ChunkTranscript {
@@ -352,9 +408,10 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                 let mut lines = Vec::with_capacity(processed.segments.len());
                 for seg in &processed.segments {
                     let ts = fmt_timestamp(seg.start_secs);
+                    let who = speaker_label(seg.leg, seg.turn);
                     let text = polish(&spell, &sentences, &seg.text);
-                    transcript_md.push_str(&format!("**[{}] {}:** {}\n\n", ts, seg.leg, text));
-                    lines.push(format!("[{}] {}: {}", ts, seg.leg, text));
+                    transcript_md.push_str(&format!("**[{ts}] {who}:** {text}\n\n"));
+                    lines.push(format!("[{ts}] {who}: {text}"));
                 }
                 if !lines.is_empty() {
                     let _ = tx.send(Status::Transcript {
@@ -535,5 +592,92 @@ mod tests {
         // existed". Rendering T1 there would assert something we do not know.
         assert_eq!(speaker_label("system", None), "system");
         assert_eq!(speaker_label("mic", None), "mic");
+    }
+
+    fn raw(text: &str, start_cs: i64, turn_flag: bool) -> RawSegment {
+        RawSegment {
+            text: text.into(),
+            start_cs,
+            end_cs: start_cs + 100,
+            no_speech_prob: 0.01,
+            turn_flag,
+        }
+    }
+
+    fn turns(out: &[SegmentOut]) -> Vec<Option<u32>> {
+        out.iter().map(|s| s.turn).collect()
+    }
+
+    #[test]
+    fn number_turns_with_no_flags_puts_everything_in_turn_one() {
+        let raws = vec![
+            raw("one", 0, false),
+            raw("two", 100, false),
+            raw("three", 200, false),
+        ];
+        let out = number_turns(raws, "system", Duration::ZERO, true);
+        assert_eq!(turns(&out), vec![Some(1), Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn number_turns_increments_after_the_flagged_segment_not_before() {
+        // tdrz flags "a change happens AFTER this segment", so the flagged
+        // segment itself still belongs to the outgoing turn.
+        let raws = vec![
+            raw("a", 0, true),
+            raw("b", 100, false),
+            raw("c", 200, false),
+        ];
+        let out = number_turns(raws, "system", Duration::ZERO, true);
+        assert_eq!(turns(&out), vec![Some(1), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn a_turn_flagged_on_a_filtered_segment_still_advances_the_counter() {
+        // Regression guard. A pause between two speakers is exactly where a
+        // non-speech marker and a turn change coincide. Incrementing inside the
+        // filter would swallow the boundary and merge two speakers into T1.
+        let raws = vec![
+            raw("before", 0, false),
+            raw("[BLANK_AUDIO]", 100, true),
+            raw("after", 200, false),
+        ];
+        let out = number_turns(raws, "system", Duration::ZERO, true);
+        assert_eq!(out.len(), 2, "the marker segment must not be emitted");
+        assert_eq!(turns(&out), vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn a_flag_on_the_final_segment_creates_no_phantom_turn() {
+        let raws = vec![raw("a", 0, false), raw("b", 100, true)];
+        let out = number_turns(raws, "system", Duration::ZERO, true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(turns(&out), vec![Some(1), Some(1)]);
+    }
+
+    #[test]
+    fn turns_are_none_when_the_model_cannot_diarize() {
+        let raws = vec![raw("a", 0, true), raw("b", 100, false)];
+        let out = number_turns(raws, "system", Duration::ZERO, false);
+        assert_eq!(turns(&out), vec![None, None]);
+    }
+
+    #[test]
+    fn number_turns_on_empty_input_is_empty() {
+        assert!(number_turns(Vec::new(), "mic", Duration::ZERO, true).is_empty());
+    }
+
+    #[test]
+    fn number_turns_makes_timestamps_session_relative() {
+        // 250 centiseconds = 2.5s into a chunk that starts 60s into the session.
+        let out = number_turns(
+            vec![raw("a", 250, false)],
+            "mic",
+            Duration::from_secs(60),
+            true,
+        );
+        assert_eq!(out[0].start_secs, 62.5);
+        assert_eq!(out[0].end_secs, 63.5);
+        assert_eq!(out[0].leg, "mic");
     }
 }

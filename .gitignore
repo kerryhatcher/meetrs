@@ -22,3 +22,7 @@ target
 
 # Bundled .app produced by scripts/bundle.sh
 *.app/
+
+# Real captured audio kept for manual diarization checks. Never committed:
+# hundreds of MB of f32 WAV, and it is recorded meeting content.
+fixtures/

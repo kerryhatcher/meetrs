@@ -134,6 +134,20 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             "#,
         )?;
     }
+    if version < 2 {
+        // Nullable on purpose: rows written before turn detection existed read
+        // NULL, which is distinguishable from a real turn number. No backfill —
+        // those sessions were transcribed by a model that cannot diarize.
+        //
+        // segments_fts is external-content over `text` alone and the triggers
+        // only reference rowid/text, so none of them are affected.
+        tx.execute_batch(
+            r#"
+            ALTER TABLE segments ADD COLUMN turn INTEGER;
+            PRAGMA user_version = 2;
+            "#,
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -144,6 +158,8 @@ pub struct SegmentIn {
     pub end_secs: f64,
     pub text: String,
     pub no_speech_prob: f32,
+    /// Chunk-local, per-leg speaker turn. `None` stores NULL.
+    pub turn: Option<u32>,
 }
 
 pub struct Hit {
@@ -151,6 +167,7 @@ pub struct Hit {
     pub started_at: String,
     pub chunk_index: i64,
     pub leg: String,
+    pub turn: Option<u32>,
     pub start_secs: f64,
     /// FTS5 snippet() with the matched terms marked.
     pub snippet: String,
@@ -276,8 +293,8 @@ impl Db {
         )?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO segments (chunk_id, leg, start_secs, end_secs, text, no_speech_prob)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO segments (chunk_id, leg, start_secs, end_secs, text, no_speech_prob, turn)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for s in segs {
                 stmt.execute(params![
@@ -287,6 +304,7 @@ impl Db {
                     s.end_secs,
                     s.text,
                     s.no_speech_prob,
+                    s.turn,
                 ])?;
             }
         }
@@ -314,7 +332,7 @@ impl Db {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.dir, s.started_at, c.idx, seg.leg, seg.start_secs,
-                    snippet(segments_fts, 0, '[', ']', '...', 10)
+                    snippet(segments_fts, 0, '[', ']', '...', 10), seg.turn
              FROM segments_fts
              JOIN segments seg ON seg.id = segments_fts.rowid
              JOIN chunks c ON c.id = seg.chunk_id
@@ -331,6 +349,7 @@ impl Db {
                 leg: r.get(3)?,
                 start_secs: r.get(4)?,
                 snippet: r.get(5)?,
+                turn: r.get(6)?,
             })
         });
         let rows = match rows {
@@ -413,6 +432,7 @@ impl Db {
                             end_secs: s.end_secs,
                             text: s.text,
                             no_speech_prob: s.no_speech_prob,
+                            turn: s.turn,
                         })
                         .collect();
                     let _ = self.record_segments(&dir, mc.index, &segs);
@@ -461,6 +481,9 @@ struct RebuildSegment {
     end_secs: f64,
     text: String,
     no_speech_prob: f32,
+    /// Chunk JSONs written before turn detection lack this field entirely.
+    #[serde(default)]
+    turn: Option<u32>,
 }
 
 #[cfg(test)]
@@ -503,6 +526,57 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+    #[test]
+    fn migration_adds_the_turn_column() {
+        let path = tmp_db_path("turn-column");
+        let _ = std::fs::remove_file(&path);
+        let db = open_at(&path).unwrap();
+        let cols: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('segments')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains(&"turn".to_string()), "columns were {cols:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn turn_round_trips_and_none_becomes_null() {
+        let path = tmp_db_path("turn-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let mut db = open_at(&path).unwrap();
+        let dir = PathBuf::from("/tmp/session-turn");
+        db.start_session(&dir, &info(), "earshot", "2026-01-01T00:00:00Z")
+            .unwrap();
+        db.record_chunk(&dir, 0, "chunk-000.wav", 5.0, 0.0, 1234)
+            .unwrap();
+
+        let mut known = seg("first speaker", 0.0);
+        known.turn = Some(2);
+        let mut unknown = seg("unknown speaker", 1.0);
+        unknown.turn = None;
+        db.record_segments(&dir, 0, &[known, unknown]).unwrap();
+
+        let stored: Vec<Option<i64>> = db
+            .conn
+            .prepare("SELECT turn FROM segments ORDER BY start_secs")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(stored, vec![Some(2), None]);
+
+        let hits = db.search("speaker", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.turn == Some(2)));
+        assert!(hits.iter().any(|h| h.turn.is_none()));
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::*;
     use crate::types::CaptureInfo;
 
@@ -530,6 +604,7 @@ mod tests {
             end_secs: start + 1.0,
             text: text.into(),
             no_speech_prob: 0.01,
+            turn: None,
         }
     }
 
@@ -542,7 +617,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         drop(db);
         // Reopening must not error and must not bump/reset the version.
         let db2 = open_at(&path).unwrap();
@@ -550,7 +625,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v2, 1);
+        assert_eq!(v2, 2);
         let _ = std::fs::remove_file(&path);
     }
 

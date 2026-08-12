@@ -295,7 +295,7 @@ fn search(query: &str) -> Result<()> {
             h.started_at,
             fmt_hms(h.start_secs),
             h.chunk_index,
-            h.leg,
+            crate::transcribe::speaker_label(&h.leg, h.turn),
             h.snippet.replace('\n', " "),
             h.session_dir
         );

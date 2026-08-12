@@ -436,6 +436,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                             end_secs: s.end_secs,
                             text: s.text.clone(),
                             no_speech_prob: s.no_speech_prob,
+                            turn: s.turn,
                         })
                         .collect();
                     if let Err(e) = db.record_segments(&dir, job.index, &rows) {

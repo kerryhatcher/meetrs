@@ -11,6 +11,7 @@ mod compress;
 mod db;
 mod lock;
 mod model;
+mod tcc;
 mod transcribe;
 mod types;
 mod ui;
@@ -34,6 +35,23 @@ fn main() -> Result<()> {
         Some("--search") => return search(&args[1..].join(" ")),
         Some("--reindex") => return reindex(),
         _ => {}
+    }
+
+    // Before anything opens the audio device: TCC judges the *responsible*
+    // process, which for a shell-launched program is the terminal, and terminals
+    // have no NSAudioCaptureUsageDescription — so the tap is refused without a
+    // prompt and the IOProc silently never runs. Re-exec so meetrs.app is the
+    // subject instead. See src/tcc.rs. This replaces the process image, so it
+    // has to happen before the lock and before the TUI.
+    if args.first().map(String::as_str) != Some("--compress") {
+        match tcc::adopt_own_identity()? {
+            tcc::Identity::Own => {}
+            tcc::Identity::Unbundled => eprintln!(
+                "meetrs: running outside meetrs.app, so system audio will be denied \
+                 (the microphone still works). Install with `just install` and run \
+                 the installed `meetrs`."
+            ),
+        }
     }
 
     // Held for the whole process. Two instances would fight over the same audio
@@ -337,8 +355,21 @@ fn check() -> Result<()> {
         // from here, so report which one it was instead of just the symptom.
         let io = capture::io_stats();
         let why = if io.calls == 0 {
-            "the IOProc was never invoked — Core Audio never started the device or \
-             never registered the block (macOS 26 silently no-ops a nil dispatch queue)"
+            // Registration always passes a real serial dispatch queue and rejects
+            // a null IOProc ID, so the macOS 26 nil-queue no-op is ruled out by
+            // construction. Two causes remain, and they are not equally alarming:
+            // the aggregate is tap-driven, so coreaudiod runs no cycle at all
+            // until some process writes system audio — a silent machine yields
+            // zero callbacks rather than zero-valued samples. The other is a TCC
+            // denial of the tap (see src/tcc.rs), where the device still starts
+            // and AudioDeviceStart still returns noErr. The coreaudiod log
+            // distinguishes them outright, so hand over the exact strings.
+            "the IOProc was never invoked. Either nothing was playing — the tap is only \
+             driven while some process writes system audio, so retry with audio playing \
+             — or the tap was denied. Tell those apart with:\n  \
+             log show --last 2m --predicate 'process == \"coreaudiod\"' | grep -i tap\n  \
+             \"Starting tap after waiting for writers\" = allowed; \
+             \"Client is not granted access to the tap\" = denied"
         } else if io.shape_mismatch == io.calls {
             "every cycle was dropped because the device's buffer count disagreed with \
              the stream layout discovered at start()"
@@ -350,12 +381,13 @@ fn check() -> Result<()> {
         anyhow::bail!(
             "no frames arrived at all — capture started but delivered nothing.\n\
              {why}.\n\
-             ioproc calls={} shape-mismatch={} empty={} last mNumberBuffers={} (expected {})",
+             ioproc calls={} shape-mismatch={} empty={} last mNumberBuffers={} (expected {}){}",
             io.calls,
             io.shape_mismatch,
             io.empty,
             io.last_n_buffers,
             io.expected_n_buffers,
+            attribution_note(),
         );
     }
     let rms = |sq: f64, n: u64| (sq / n as f64).sqrt() as f32;
@@ -368,11 +400,38 @@ fn check() -> Result<()> {
         sys_peak
     );
     if sys_peak == 0.0 {
+        // Three causes, cheapest first. Nothing playing is by far the most common
+        // and is not a bug at all: the mic drives the cycles while the tap
+        // contributes zero-filled buffers. A denied tap looks the same from here
+        // (mic allowed, tap refused, because terminals carry
+        // NSMicrophoneUsageDescription but not NSAudioCaptureUsageDescription),
+        // and only once both are ruled out is this the Core Audio bug.
         println!(
             "\nWARNING: system leg is bit-exact zero across {frames} frames.\n\
-             That is the signature of the process-tap zero-samples bug, not quiet audio.\n\
-             See docs/research/rust-audio-macos.md in git history"
+             Most likely nothing was playing — retry with audio playing, since a silent \
+             system tap contributes zero-filled buffers while the mic keeps the cycles \
+             running.\n\
+             If audio *was* playing, the tap was refused while the mic was allowed; if TCC \
+             attribution is correct too, this is the process-tap zero-samples bug — see \
+             docs/research/rust-audio-macos.md in git history.{}",
+            attribution_note()
         );
     }
     Ok(())
+}
+
+/// Names the application TCC is actually asking about, when that is not meetrs.
+/// Empty when we are our own subject, so it can be appended unconditionally.
+fn attribution_note() -> String {
+    match tcc::foreign_responsible_process() {
+        Some((pid, path)) => format!(
+            "\n\nTCC is attributing this process to {} (pid {}), not to meetrs, so that \
+             application is the one being checked for permission — and it needs \
+             NSAudioCaptureUsageDescription, which terminals do not ship. Run the \
+             installed bundle (`just install`, then `meetrs`) so meetrs is its own subject.",
+            path.display(),
+            pid
+        ),
+        None => String::new(),
+    }
 }

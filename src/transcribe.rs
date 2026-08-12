@@ -195,17 +195,18 @@ fn whisper_threads() -> i32 {
     cores.saturating_sub(1).max(1) as i32
 }
 
-fn full_params() -> FullParams<'static, 'static> {
+fn full_params(tdrz: bool) -> FullParams<'static, 'static> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
     params.set_n_threads(whisper_threads());
     params.set_language(Some("en"));
     params.set_translate(false);
-    // Stops whisper.cpp suppressing token 50359 ([_SOLM_]) at -INFINITY. Safe to
-    // set unconditionally: on a non-tdrz model the token is untrained and never
-    // fires, and `model_supports_tdrz` is what decides whether we believe it.
-    // The token sits above token_eot, so with set_print_special(false) below it
-    // never leaks into segment text.
-    params.set_tdrz_enable(true);
+    // Stops whisper.cpp suppressing token 50359 ([_SOLM_]) at -INFINITY, so a
+    // trained tdrz model can emit it. Gated on `tdrz` rather than left on
+    // unconditionally: on a non-tdrz model the token is untrained, so leaving it
+    // un-suppressed just gives argmax one more way to pick an unintended token —
+    // and if it ever wins, whisper.cpp closes the segment as a turn boundary,
+    // fragmenting timestamps for a model that was never asked to diarize.
+    params.set_tdrz_enable(tdrz);
     // These would corrupt the TUI by writing straight to stdout/stderr.
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -227,7 +228,7 @@ fn transcribe_leg(
     }
     let mut state = ctx.create_state().context("creating whisper state")?;
     state
-        .full(full_params(), mono_16k)
+        .full(full_params(tdrz_available), mono_16k)
         .context("running whisper full()")?;
 
     let n = state.full_n_segments();

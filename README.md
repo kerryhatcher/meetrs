@@ -25,8 +25,13 @@ cargo build --release
 First run downloads the transcription model (`ggml-small.en-tdrz.bin`, 465 MiB)
 to `~/.meetrs/models/`. It is the tinydiarize fine-tune of `small.en` — the only
 published Whisper model that marks speaker turns, which is why it is unquantized
-and eight times the size of a plain `base.en`. Set `MEETRS_MODEL` to use a model
-you already have; transcripts then simply carry no `T` numbers.
+and eight times the size of a plain `base.en`. A speaker turn shows up in a
+transcript as a `T` number after the leg, e.g. `system/T3`: tinydiarize flags
+where the speaker changed between two segments, so segments sharing a number
+are believed to be the same speaker and a higher number is a different speaker
+from the one before it (more on exactly what that does and doesn't claim below,
+under `transcript.md`). Set `MEETRS_MODEL` to use a model you already have;
+transcripts then simply carry no `T` numbers.
 
 Upgrading from an earlier version leaves the superseded `ggml-base.en-q5_1.bin`
 in that directory. meetrs grooms nothing, so delete it yourself if you want the
@@ -87,14 +92,25 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
 
 State and a full-text index live in a SQLite database at `~/.meetrs/meetrs.db`.
 
-`transcript.md` looks like this — the mic and system legs are transcribed
-separately, which gives speaker attribution with no diarization model:
+`transcript.md` looks like this:
 
 ```
-**[00:00:00] system:** The quick brown fox jumps over the lazy dog.
+**[00:00:00] system/T1:** The quick brown fox jumps over the lazy dog.
 
-**[00:00:09] system:** Meeting notes for the third of August about audio capture.
+**[00:00:09] system/T2:** Meeting notes for the third of August about audio capture.
 ```
+
+The mic and system legs are transcribed separately, but a leg is an *acoustic
+path*, not a person — in an in-person meeting there is no system audio at all
+and everyone arrives on the mic leg, so "leg" is never a stand-in for "speaker".
+Turn numbers only ever go up within a leg, never repeat or alternate: tinydiarize
+can tell you turn *N* differs from turn *N+1*, not whether turn 3 returns to
+turn 1's speaker, so `T1, T2, T3…` is the strongest claim the signal supports.
+
+T numbers also restart at `T1` in every chunk (chunks split on silence, roughly
+every few minutes) and are scoped to one leg, so `system/T1` in one chunk is
+not the same person as `system/T1` in the next, or as `mic/T1` in the same
+chunk. They identify a turn, never a specific person.
 
 Each chunk is closed and `fsync`ed before the next opens, so the only audio at
 risk from a crash is the chunk in flight.

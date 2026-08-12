@@ -810,4 +810,45 @@ mod tests {
         assert!(result.is_ok());
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn rebuild_segment_turn_defaults_to_none_when_the_field_is_absent() {
+        // Pins the `#[serde(default)]` on RebuildSegment::turn: chunk JSONs
+        // written before turn detection existed have no `turn` key at all, and
+        // `--reindex` must insert NULL for them rather than fail to parse — a
+        // parse failure here is swallowed by `if let Ok(t) = ...` at the
+        // reindex call site, so a regression would silently drop every segment
+        // from the search index while still reporting "indexed N chunk(s)".
+        let raw = r#"{
+            "segments": [
+                {
+                    "leg": "system",
+                    "start_secs": 0.0,
+                    "end_secs": 1.0,
+                    "text": "hello",
+                    "no_speech_prob": 0.01
+                }
+            ]
+        }"#;
+        let t: RebuildTranscript = serde_json::from_str(raw).unwrap();
+        assert_eq!(t.segments[0].turn, None);
+    }
+
+    #[test]
+    fn rebuild_segment_turn_round_trips_when_the_field_is_present() {
+        let raw = r#"{
+            "segments": [
+                {
+                    "leg": "system",
+                    "start_secs": 0.0,
+                    "end_secs": 1.0,
+                    "text": "hello",
+                    "no_speech_prob": 0.01,
+                    "turn": 3
+                }
+            ]
+        }"#;
+        let t: RebuildTranscript = serde_json::from_str(raw).unwrap();
+        assert_eq!(t.segments[0].turn, Some(3));
+    }
 }

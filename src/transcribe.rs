@@ -107,6 +107,20 @@ fn session_relative_secs(offset: Duration, chunk_local_secs: f64) -> f64 {
     offset.as_secs_f64() + chunk_local_secs
 }
 
+/// How a segment's speaker is named in every output sink. `None` renders bare:
+/// turn numbers are a claim, and we only make it when tinydiarize supplied one.
+///
+/// Turn numbers are chunk-local and per-leg — `system/T1` in chunk 3 is not the
+/// same person as `system/T1` in chunk 4. Collapsing turns into stable speakers
+/// needs embeddings and is deliberately out of scope here.
+#[allow(dead_code)]
+pub(crate) fn speaker_label(leg: &str, turn: Option<u32>) -> String {
+    match turn {
+        Some(n) => format!("{leg}/T{n}"),
+        None => leg.to_string(),
+    }
+}
+
 fn whisper_threads() -> i32 {
     // Leave at least one core for the audio callback + writer thread — an
     // overrun there is far worse than transcription running a bit slower.
@@ -507,5 +521,19 @@ mod tests {
         assert_eq!(fmt_timestamp(0.0), "00:00:00");
         assert_eq!(fmt_timestamp(65.4), "00:01:05");
         assert_eq!(fmt_timestamp(3661.0), "01:01:01");
+    }
+
+    #[test]
+    fn speaker_label_appends_the_turn_when_known() {
+        assert_eq!(speaker_label("system", Some(3)), "system/T3");
+        assert_eq!(speaker_label("mic", Some(1)), "mic/T1");
+    }
+
+    #[test]
+    fn speaker_label_is_bare_when_the_turn_is_unknown() {
+        // None means "this model cannot diarize" or "recorded before turns
+        // existed". Rendering T1 there would assert something we do not know.
+        assert_eq!(speaker_label("system", None), "system");
+        assert_eq!(speaker_label("mic", None), "mic");
     }
 }

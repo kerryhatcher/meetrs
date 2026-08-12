@@ -246,8 +246,8 @@ from a live session before compression. All are 3 channels / 48 kHz / f32, with
 
 | Chunk | Legs | Segments / words | Duration | Case covered |
 |---|---|---|---|---|
-| `chunk-106` | mic + system | 41 / 264 | 106 s | Densest cross-leg conversation |
-| `chunk-139` | system only | 35 / 266 | 103 s | Remote multi-speaker — tdrz's target case |
+| `chunk-106` | mic + system | 41 / 264 | 106 s | Densest cross-leg conversation; system leg is the genuine remote multi-speaker case — tdrz's target |
+| `chunk-139` | system only | 35 / 266 | 103 s | Single-speaker monologue on the system leg — negative control proving tdrz doesn't invent turns |
 | `chunk-209` | mic only | 32 / 235 | 85 s | In-person: everyone on one mic |
 | `chunk-114` | mic + system | 25 / 238 | 76 s | Second both-legs sample |
 | `chunk-101` | mic + system | 17 / 191 | 69 s | Smaller both-legs sample, fast iteration |

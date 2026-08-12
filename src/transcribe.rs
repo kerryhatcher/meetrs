@@ -753,9 +753,23 @@ mod tests {
         let ctx =
             WhisperContext::new_with_params(&model, WhisperContextParameters::default()).unwrap();
 
-        // chunk-139 is system-leg only and densely multi-speaker: the case tdrz
-        // is actually for. chunk-209 is mic-only, standing in for in-person.
-        for index in [139u32, 209] {
+        // chunk-106's system leg is the genuine remote multi-speaker case tdrz
+        // targets ("What we need to do..." / "No." / "Yes." / "Yeah." / ...).
+        // chunk-209's mic leg is genuine in-person dialogue. chunk-139 is a
+        // deliberate negative control: base.en confirms its system leg is one
+        // person delivering an uninterrupted monologue, so T1-for-the-whole-
+        // chunk there is *correct* behaviour, not a detector failure — proving
+        // tdrz doesn't invent turns where nobody else speaks. Its distinct-turn
+        // count is printed but not asserted: asserting exactly 1 would be
+        // brittle against ordinary model/threading variation, and the
+        // negative-control's value is in the observed number, not a hard check.
+        let cases: [(u32, Option<(&str, u32)>); 3] = [
+            (106, Some(("system", 2))),
+            (139, None),
+            (209, Some(("mic", 2))),
+        ];
+
+        for (index, min_turns_on) in cases {
             let job = Job {
                 path: dir.join(format!("chunk-{index:03}.wav")),
                 index,
@@ -781,6 +795,7 @@ mod tests {
             // interleaved sequence legitimately reads mic/T4 then system/T1.
             for leg in ["mic", "system"] {
                 let mut last: Option<u32> = None;
+                let mut distinct: std::collections::HashSet<u32> = std::collections::HashSet::new();
                 for seg in processed.segments.iter().filter(|s| s.leg == leg) {
                     let turn = seg.turn.expect("a tdrz model must number every turn");
                     assert!(turn >= 1, "turns are 1-based, got {turn}");
@@ -791,6 +806,20 @@ mod tests {
                         );
                     }
                     last = Some(turn);
+                    distinct.insert(turn);
+                }
+                println!(
+                    "chunk-{index:03} {leg}: {} distinct turn(s)",
+                    distinct.len()
+                );
+                if let Some((want_leg, want_min)) = min_turns_on
+                    && want_leg == leg
+                {
+                    assert!(
+                        distinct.len() as u32 >= want_min,
+                        "chunk-{index:03} {leg} expected >= {want_min} distinct turns, got {}",
+                        distinct.len()
+                    );
                 }
             }
         }

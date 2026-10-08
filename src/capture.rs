@@ -272,7 +272,13 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
             CFString::from_str(&agg_uid).as_ref(),
             CFString::from_str("meetrs-capture").as_ref(),
             CFBoolean::new(true).as_ref(),
-            CFBoolean::new(true).as_ref(),
+            // TapAutoStart must stay false. When true, coreaudiod parks the whole
+            // aggregate in an autostart context until some process writes system
+            // audio, mic leg included: with nothing playing the IOProc is never
+            // called, so a mic-only session (in-person meeting, or the minutes
+            // before remote audio starts) records nothing at all. False starts IO
+            // immediately; the tap just contributes zeros while the system is quiet.
+            CFBoolean::new(false).as_ref(),
             CFString::from_str(&device_uid).as_ref(),
             sub_device_list.as_ref(),
             tap_list.as_ref(),

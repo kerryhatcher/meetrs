@@ -391,11 +391,9 @@ fn observe_opening(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo)
 /// Refuse to start a recording that is provably going to capture nothing, and
 /// warn where the cause is genuinely ambiguous.
 ///
-/// The ambiguity is unavoidable and worth spelling out: the aggregate is
-/// tap-driven, so before a meeting starts — nothing playing — no callbacks arrive
-/// at all, which looks identical to a refused tap. Aborting on that would make
-/// meetrs impossible to launch *ahead* of a meeting, which is when you want it.
-/// So only the provable cases abort.
+/// The aggregate is mic-driven (tap autostart is off, see capture.rs), so cycles
+/// arrive whether or not anything is playing, and a quiet system tap shows up as
+/// zero-filled system channels rather than as no callbacks at all.
 fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Result<()> {
     // The failure this exists to catch: with TCC attributing us to the terminal,
     // the tap is refused and the whole session is silence. Always fatal, and
@@ -425,10 +423,9 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
 
     let warning = if opening.frames == 0 {
         Some(
-            "no audio arrived in the first second. The tap only runs while some process \
-             writes system audio, so this is expected before a meeting starts — but it \
-             also looks exactly like a refused tap. `just check` with audio playing tells \
-             them apart.",
+            "no audio arrived in the first second. The microphone should drive capture \
+             even with nothing playing, so the device has not started or its consent was \
+             refused. `just check` reports why the IOProc delivered nothing.",
         )
     } else if !opening.mic_signal {
         Some(
@@ -504,18 +501,15 @@ fn check() -> Result<()> {
         let why = if io.calls == 0 {
             // Registration always passes a real serial dispatch queue and rejects
             // a null IOProc ID, so the macOS 26 nil-queue no-op is ruled out by
-            // construction. Two causes remain, and they are not equally alarming:
-            // the aggregate is tap-driven, so coreaudiod runs no cycle at all
-            // until some process writes system audio — a silent machine yields
-            // zero callbacks rather than zero-valued samples. The other is a TCC
-            // denial of the tap (see src/tcc.rs), where the device still starts
-            // and AudioDeviceStart still returns noErr. The coreaudiod log
-            // distinguishes them outright, so hand over the exact strings.
-            "the IOProc was never invoked. Either nothing was playing — the tap is only \
-             driven while some process writes system audio, so retry with audio playing \
-             — or the tap was denied. Tell those apart with:\n  \
-             log show --last 2m --predicate 'process == \"coreaudiod\"' | grep -i tap\n  \
-             \"Starting tap after waiting for writers\" = allowed; \
+            // construction. Tap autostart is off, so the mic drives cycles even on
+            // a silent machine; zero callbacks means the device never ran. If
+            // autostart ever gets switched back on, a silent machine looks
+            // exactly like this (coreaudiod logs `register_autostart_context`
+            // and then never starts IO). Otherwise it is a TCC denial (see
+            // src/tcc.rs), where AudioDeviceStart still returns noErr.
+            // `/usr/bin/log` rather than `log`: zsh has a `log` builtin.
+            "the IOProc was never invoked. Check whether the tap was denied with:\n  \
+             /usr/bin/log show --last 2m --predicate 'process == \"coreaudiod\"' | grep -i tap\n  \
              \"Client is not granted access to the tap\" = denied"
         } else if io.shape_mismatch == io.calls {
             "every cycle was dropped because the device's buffer count disagreed with \

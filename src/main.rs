@@ -393,7 +393,8 @@ fn observe_opening(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo)
 ///
 /// The aggregate is mic-driven (tap autostart is off, see capture.rs), so cycles
 /// arrive whether or not anything is playing, and a quiet system tap shows up as
-/// zero-filled system channels rather than as no callbacks at all.
+/// zero-filled system channels rather than as no callbacks at all. That is what
+/// makes an empty first second provable rather than ambiguous.
 fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Result<()> {
     // The failure this exists to catch: with TCC attributing us to the terminal,
     // the tap is refused and the whole session is silence. Always fatal, and
@@ -411,7 +412,32 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
 
     let opening = observe_opening(consumer, info);
 
-    if opening.frames > 0 && !opening.mic_signal && !opening.system_signal {
+    if let Some(warning) = judge(opening)? {
+        eprintln!("meetrs: {warning}");
+        // The TUI clears the screen the instant it starts, so a warning printed
+        // and immediately painted over is a warning nobody reads.
+        std::thread::sleep(Duration::from_millis(2500));
+    }
+    Ok(())
+}
+
+/// What the opening of the stream means for the session: an error when it would
+/// provably record nothing, a warning when a leg looks wrong, `None` when healthy.
+fn judge(opening: Opening) -> Result<Option<&'static str>> {
+    // Fatal now that the mic drives capture: with tap autostart off, cycles run
+    // whether or not anything is playing, so an empty first second is never the
+    // benign "meeting hasn't started" case. It is a device that never ran.
+    if opening.frames == 0 {
+        anyhow::bail!(
+            "no audio arrived in the first second, so this recording would contain \
+             nothing.\n\
+             The microphone drives capture even with nothing playing, so the audio device \
+             never started or its consent was refused. Run `just check` to see why the \
+             IOProc delivered nothing."
+        );
+    }
+
+    if !opening.mic_signal && !opening.system_signal {
         anyhow::bail!(
             "capture is running but every sample on both legs is bit-exact zero, so this \
              recording would contain nothing.\n\
@@ -421,13 +447,7 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
         );
     }
 
-    let warning = if opening.frames == 0 {
-        Some(
-            "no audio arrived in the first second. The microphone should drive capture \
-             even with nothing playing, so the device has not started or its consent was \
-             refused. `just check` reports why the IOProc delivered nothing.",
-        )
-    } else if !opening.mic_signal {
+    Ok(if !opening.mic_signal {
         Some(
             "the microphone leg is bit-exact zero while system audio flows — the mic is \
              muted or its consent was denied. System audio will still be recorded.",
@@ -439,15 +459,7 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
         )
     } else {
         None
-    };
-
-    if let Some(warning) = warning {
-        eprintln!("meetrs: {warning}");
-        // The TUI clears the screen the instant it starts, so a warning printed
-        // and immediately painted over is a warning nobody reads.
-        std::thread::sleep(Duration::from_millis(2500));
-    }
-    Ok(())
+    })
 }
 
 /// `--check`: capture for a few seconds and report the negotiated layout plus
@@ -579,7 +591,7 @@ fn attribution_note() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Opening, summarize};
+    use super::{Opening, judge, summarize};
     use crate::types::CaptureInfo;
 
     /// 1 mic channel + 2 system channels, the layout this machine negotiates.
@@ -629,6 +641,31 @@ mod tests {
         // 3 whole frames plus one stray sample.
         let samples = [0.1f32; 3 * 3 + 1];
         assert_eq!(summarize(samples.iter(), info()).frames, 3);
+    }
+
+    /// The mic drives capture even with nothing playing (tap autostart is off),
+    /// so a second with no frames at all means the device never ran. Starting the
+    /// session anyway is how three empty recordings happened on 2026-10-08.
+    #[test]
+    fn no_frames_at_all_refuses_the_session() {
+        let opening = Opening {
+            frames: 0,
+            mic_signal: false,
+            system_signal: false,
+        };
+        assert!(judge(opening).is_err());
+    }
+
+    /// Nothing playing is the normal state before a meeting: the mic flows and
+    /// the tap is zero-filled. That must start the session, not refuse it.
+    #[test]
+    fn a_live_mic_with_nothing_playing_still_starts() {
+        let opening = Opening {
+            frames: 48_000,
+            mic_signal: true,
+            system_signal: false,
+        };
+        assert!(matches!(judge(opening), Ok(Some(_))));
     }
 
     /// The preflight reads the ring buffer and deliberately does not commit, so

@@ -234,6 +234,15 @@ impl Db {
         Ok(())
     }
 
+    /// Forget a session and everything under it (chunks, segments, search
+    /// rows cascade). For a session that captured nothing and whose directory
+    /// has been removed. A no-op when the session was never indexed.
+    pub fn delete_session(&mut self, dir: &Path) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM sessions WHERE dir = ?1", params![dir_key(dir)])?;
+        Ok(())
+    }
+
     pub fn finish_session(&mut self, dir: &Path, chunks: u32, total_secs: f64) -> Result<()> {
         let session_id = self.require_session_id(dir)?;
         self.conn.execute(
@@ -626,6 +635,21 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v2, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_session_removes_the_session_and_tolerates_an_unknown_one() {
+        let path = tmp_db_path("delete-session");
+        let _ = std::fs::remove_file(&path);
+        let mut db = open_at(&path).unwrap();
+        let dir = PathBuf::from("/tmp/session-gone");
+        db.start_session(&dir, &info(), "earshot", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        db.delete_session(&dir).unwrap();
+        assert!(db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10).is_err());
+        db.delete_session(&dir).unwrap();
         let _ = std::fs::remove_file(&path);
     }
 

@@ -90,12 +90,16 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
   transcript.md      speaker-labelled, human-readable
 ```
 
-A recording left running past midnight rolls over: at 00:00 local time the current
-chunk is closed and a new session starts in its own directory
-(`2026-08-04T00-00-00`), with chunk numbers and transcript timestamps starting
-again from zero. Each calendar day gets its own `transcript.md`, and the full-text
-index treats them as separate sessions. (If the machine slept through midnight,
-the rollover happens when audio resumes, in the directory for that day.)
+A recording left running doesn't pile everything into one log. A session ends at
+local midnight, or after 30 minutes with no speech, and the next session starts
+the moment speech is detected again. It gets its own directory named for that
+moment (`2026-08-04T08-12-40`), its own `transcript.md`, and chunk numbers and
+timestamps starting from zero; the full-text index treats it as a separate
+session. While it waits, the header reads `idle, waiting for speech`. A session
+that captured nothing (you started the recorder long before the meeting) is
+discarded rather than left as an empty directory. Midnight with nobody talking
+therefore leaves nothing for the new day until someone does, and a Mac that slept
+through the gap starts the next session when audio resumes.
 
 State and a full-text index live in a SQLite database at `~/.meetrs/meetrs.db`.
 

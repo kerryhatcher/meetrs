@@ -7,8 +7,8 @@
 //!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, jobs: mpsc::Sender<Job>, stop: StopFlag) -> Result<Summary>
 
 use crate::types::{
-    CaptureInfo, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status, next_midnight, session_dir,
-    start_of_day,
+    CaptureInfo, IDLE_ROLLOVER, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status, next_midnight,
+    session_dir,
 };
 use crate::vad::Vad;
 use anyhow::Result;
@@ -261,13 +261,27 @@ pub fn run(
             None
         }
     };
+    // earshot's construction is pure computation (embedded model, no I/O), so
+    // it shouldn't fail — but losing a whole recording because a VAD wouldn't
+    // init would be far worse than degraded RMS-threshold chunking, so guard
+    // it anyway and fall back rather than aborting.
+    let vad = match std::panic::catch_unwind(Vad::new) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            let _ = tx.send(Status::Warning(
+                "VAD failed to initialize; falling back to RMS-threshold chunking".into(),
+            ));
+            None
+        }
+    };
     let mut clock = chrono::Local::now;
-    let mut new_dir_for = |day_start| session_dir(start_of_day(day_start));
+    let mut new_dir_for = session_dir;
     record(
         consumer,
         info,
         dir,
         db,
+        vad,
         &mut clock,
         &mut new_dir_for,
         tx,
@@ -278,14 +292,22 @@ pub fn run(
 
 /// The writer loop behind [`run`], with the outside world passed in: `clock`
 /// says what time it is, `new_dir_for` picks the directory for the session that
-/// starts at the given time, and `db` is the index. That is what lets a test
-/// carry a recording across midnight without waiting for one or touching `$HOME`.
+/// starts at the given time, `db` is the index, and `vad` decides what is speech
+/// (`None` falls back to an RMS threshold). That is what lets a test carry a
+/// recording across midnight, or through a long silence, without waiting for one
+/// or touching `$HOME`.
+///
+/// A session ends at local midnight or after `IDLE_ROLLOVER` without speech, and
+/// the next session starts when speech is next detected. It is started by speech
+/// rather than by the clock so that quiet stretches (overnight, a meeting that
+/// never began) leave no empty sessions behind.
 #[allow(clippy::too_many_arguments)]
 fn record(
     mut consumer: rtrb::Consumer<f32>,
     info: CaptureInfo,
     first_dir: PathBuf,
     mut db: Option<crate::db::Db>,
+    mut vad: Option<Vad>,
     clock: &mut dyn FnMut() -> chrono::DateTime<chrono::Local>,
     new_dir_for: &mut dyn FnMut(chrono::DateTime<chrono::Local>) -> Result<PathBuf>,
     tx: Sender<Status>,
@@ -299,19 +321,6 @@ fn record(
     let threshold = crate::types::silence_threshold();
     let started = clock();
 
-    // earshot's construction is pure computation (embedded model, no I/O), so
-    // it shouldn't fail — but losing a whole recording because a VAD wouldn't
-    // init would be far worse than degraded RMS-threshold chunking, so guard
-    // it anyway and fall back rather than aborting.
-    let mut vad = match std::panic::catch_unwind(Vad::new) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            let _ = tx.send(Status::Warning(
-                "VAD failed to initialize; falling back to RMS-threshold chunking".into(),
-            ));
-            None
-        }
-    };
     let detector_name = if vad.is_some() {
         "earshot (16kHz mono, 256-sample frames, per-leg)".to_string()
     } else {
@@ -328,10 +337,14 @@ fn record(
         &tx,
     )?;
 
-    // Each calendar day is its own session: a recording left running for days
-    // would otherwise mix every conversation into one log. See the rollover
-    // check at the top of the loop.
+    // Each calendar day, and each stretch of talking after a long quiet one, is
+    // its own session: a recording left running for days would otherwise mix
+    // every conversation into one log. See the rollover check below the VAD.
     let mut rollover_at = next_midnight(started);
+    let mut last_speech_at = started;
+    // The session ended for want of speech. It is already finished in the index,
+    // and the next speech starts a new one instead of continuing it.
+    let mut idle = false;
     let mut sessions = vec![dir.clone()];
     // Totals for sessions already closed by a rollover; `kept_chunks`/`total`
     // below describe only the current session.
@@ -412,76 +425,7 @@ fn record(
             continue;
         }
 
-        // Midnight: close out the day's session and start the next one in its own
-        // directory, so this batch (and everything after) lands in the new day.
-        // The new session is created before the old one is touched, so a failure
-        // (disk full, say) leaves the recording running in the old directory
-        // rather than losing audio; it retries a minute later.
         let now = clock();
-        if now >= rollover_at {
-            let begun = new_dir_for(now).and_then(|new_dir| {
-                let new_meta = begin_session(
-                    &new_dir,
-                    now,
-                    &info,
-                    threshold,
-                    &detector_name,
-                    db.as_mut(),
-                    &tx,
-                )?;
-                Ok((new_dir, new_meta))
-            });
-            match begun {
-                Err(e) => {
-                    let _ = tx.send(Status::Warning(format!(
-                        "could not start the new day's session, still recording into {}: {e:#}",
-                        dir.display()
-                    )));
-                    rollover_at = now + chrono::Duration::minutes(1);
-                }
-                Ok((new_dir, new_meta)) => {
-                    if let Some(mut oc) = current.take() {
-                        if !hold.is_empty() {
-                            write_samples(&mut oc, &hold)?;
-                        }
-                        finish_chunk(
-                            oc,
-                            &dir,
-                            &mut meta,
-                            &mut Sinks {
-                                tx: &tx,
-                                jobs: &jobs,
-                                db: db.as_mut(),
-                            },
-                            &mut kept_chunks,
-                            &mut total,
-                        )?;
-                    }
-                    hold.clear();
-                    preroll.clear();
-                    if let Some(db) = db.as_mut()
-                        && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
-                    {
-                        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
-                    }
-                    closed_chunks += kept_chunks;
-                    closed_total += total;
-
-                    dir = new_dir;
-                    meta = new_meta;
-                    sessions.push(dir.clone());
-                    next_index = 0;
-                    kept_chunks = 0;
-                    total = Duration::ZERO;
-                    session_frames = 0;
-                    // The chunk just closed is over; if speech carries on, the
-                    // chunker reopens one in the new directory this same batch.
-                    chunker.reset_after_cut();
-                    rollover_at = next_midnight(now);
-                    let _ = tx.send(Status::SessionStarted { dir: dir.clone() });
-                }
-            }
-        }
 
         let (sys_rms, sys_peak, mic_rms, mic_peak) = compute_levels(&buf, ch, &info);
         level_acc.add(sys_rms, sys_peak, mic_rms, mic_peak);
@@ -512,6 +456,106 @@ fn record(
             last_sys_speech = sys_rms >= threshold;
         }
         let speech = last_mic_speech || last_sys_speech;
+        if speech {
+            last_speech_at = now;
+        }
+
+        // A new session starts on the first speech after the old one ended:
+        // after midnight, or after the idle gap. The new session is created
+        // before the old one is touched, so a failure (disk full, say) leaves the
+        // recording running in the old directory rather than losing audio; it
+        // retries a minute later.
+        if speech && (idle || now >= rollover_at) {
+            let begun = new_dir_for(now).and_then(|new_dir| {
+                let new_meta = begin_session(
+                    &new_dir,
+                    now,
+                    &info,
+                    threshold,
+                    &detector_name,
+                    db.as_mut(),
+                    &tx,
+                )?;
+                Ok((new_dir, new_meta))
+            });
+            match begun {
+                Err(e) => {
+                    let _ = tx.send(Status::Warning(format!(
+                        "could not start a new session, still recording into {}: {e:#}",
+                        dir.display()
+                    )));
+                    idle = false;
+                    rollover_at = now + chrono::Duration::minutes(1);
+                }
+                Ok((new_dir, new_meta)) => {
+                    if let Some(mut oc) = current.take() {
+                        if !hold.is_empty() {
+                            write_samples(&mut oc, &hold)?;
+                        }
+                        finish_chunk(
+                            oc,
+                            &dir,
+                            &mut meta,
+                            &mut Sinks {
+                                tx: &tx,
+                                jobs: &jobs,
+                                db: db.as_mut(),
+                            },
+                            &mut kept_chunks,
+                            &mut total,
+                        )?;
+                    }
+                    hold.clear();
+                    preroll.clear();
+                    if kept_chunks == 0 {
+                        // Nothing was recorded (the recorder was started well
+                        // before anyone spoke): leave no blank session behind.
+                        discard_empty_session(&dir, db.as_mut(), &tx);
+                        if !dir.exists() {
+                            sessions.retain(|d| d != &dir);
+                        }
+                    } else if !idle
+                        && let Some(db) = db.as_mut()
+                        && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
+                    {
+                        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+                    }
+                    closed_chunks += kept_chunks;
+                    closed_total += total;
+
+                    dir = new_dir;
+                    meta = new_meta;
+                    sessions.push(dir.clone());
+                    next_index = 0;
+                    kept_chunks = 0;
+                    total = Duration::ZERO;
+                    session_frames = 0;
+                    idle = false;
+                    // The chunk just closed is over; if speech carries on, the
+                    // chunker reopens one in the new directory this same batch.
+                    chunker.reset_after_cut();
+                    rollover_at = next_midnight(now);
+                    let _ = tx.send(Status::SessionStarted { dir: dir.clone() });
+                }
+            }
+        } else if !speech
+            && !idle
+            && current.is_none()
+            && now - last_speech_at >= chrono::Duration::from_std(IDLE_ROLLOVER)?
+        {
+            // Long enough with nobody talking: this meeting is over. Finish it in
+            // the index now so it ends when the talking did, not when the next
+            // talking begins.
+            if kept_chunks > 0
+                && let Some(db) = db.as_mut()
+                && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
+            {
+                let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+            }
+            idle = true;
+            let _ = tx.send(Status::SessionIdle);
+        }
+
         let cut = chunker.feed(speech, frames as u64);
 
         let now_silent = !speech;
@@ -610,7 +654,10 @@ fn record(
         )?;
     }
 
-    if let Some(db) = db.as_mut()
+    // An idle session was finished when it went idle; finishing it again now
+    // would stamp it with the time the recorder quit instead.
+    if !idle
+        && let Some(db) = db.as_mut()
         && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
     {
         let _ = tx.send(Status::Warning(format!("db: {e:#}")));
@@ -628,6 +675,29 @@ fn record(
         total,
         sessions,
     })
+}
+
+/// Remove a session that recorded nothing: its index row and its directory. The
+/// directory goes only if `meta.json` is all that is in it, so this can never
+/// discard audio; otherwise it is left for a human to look at.
+fn discard_empty_session(dir: &Path, db: Option<&mut crate::db::Db>, tx: &Sender<Status>) {
+    let only_meta = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .all(|e| e.file_name() == "meta.json")
+        })
+        .unwrap_or(false);
+    if !only_meta {
+        return;
+    }
+    if let Some(db) = db
+        && let Err(e) = db.delete_session(dir)
+    {
+        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+    }
+    let _ = std::fs::remove_file(dir.join("meta.json"));
+    let _ = std::fs::remove_dir(dir);
 }
 
 fn write_samples(oc: &mut OpenChunk, samples: &[f32]) -> Result<()> {
@@ -894,108 +964,261 @@ mod tests {
         chrono::Local.from_local_datetime(&naive).unwrap()
     }
 
-    /// Drive `record` over three batches of silence on a clock that reads
-    /// 23:59:59 for the start and first batch, then 00:00:01 the next day.
-    /// `new_dir_for` is the next-session directory chooser under test.
-    fn record_across_midnight(
+    /// `count` batches of audio read at wall-clock time `at`. `loud` batches are
+    /// speech (constant 0.5 clears the RMS-threshold fallback the tests run on),
+    /// quiet ones are silence. A batch is 4096 frames, ~85ms of audio.
+    #[derive(Clone, Copy)]
+    struct Script {
+        count: usize,
+        loud: bool,
+        at: chrono::DateTime<chrono::Local>,
+    }
+
+    const fn speech(count: usize, at: chrono::DateTime<chrono::Local>) -> Script {
+        Script { count, loud: true, at }
+    }
+
+    const fn quiet(count: usize, at: chrono::DateTime<chrono::Local>) -> Script {
+        Script { count, loud: false, at }
+    }
+
+    /// Enough quiet batches that the chunker (2s of silence) closes the chunk.
+    const CUT: usize = 25;
+    /// Enough speech batches to clear MIN_CHUNK (750ms) and keep the chunk.
+    const KEPT: usize = 10;
+
+    struct Recorded {
+        summary: Summary,
+        statuses: Vec<Status>,
+        /// The time each new session was asked to start at.
+        started_at: Vec<chrono::DateTime<chrono::Local>>,
+    }
+
+    /// Run `record` over the scripted batches. The clock reads the first script's
+    /// time at startup and then each batch's own time. Sessions land in
+    /// `root/day1`, `root/day2`, ... unless `fail_new_sessions` is set.
+    fn record_script(
         root: &Path,
         db: crate::db::Db,
-        new_dir_for: &mut dyn FnMut(chrono::DateTime<chrono::Local>) -> Result<PathBuf>,
-    ) -> (Summary, Vec<Status>) {
+        script: &[Script],
+        fail_new_sessions: bool,
+    ) -> Recorded {
         let info = test_info();
         let batch_samples = 4096 * info.channels as usize;
-        let (mut producer, consumer) = rtrb::RingBuffer::new(batch_samples * 3);
-        for _ in 0..batch_samples * 3 {
-            producer.push(0.0).unwrap();
+        let total: usize = script.iter().map(|b| b.count).sum();
+        let (mut producer, consumer) = rtrb::RingBuffer::new(batch_samples * total);
+        let mut times = vec![script[0].at];
+        for b in script {
+            for _ in 0..b.count {
+                times.push(b.at);
+                for _ in 0..batch_samples {
+                    producer.push(if b.loud { 0.5 } else { 0.0 }).unwrap();
+                }
+            }
         }
         let stop = StopFlag::new();
         stop.stop(); // drain what is queued, then finish
         let (tx, rx) = std::sync::mpsc::channel();
         let (jobs, _jobs_rx) = std::sync::mpsc::channel();
 
-        let mut calls = 0;
-        let mut clock = move || {
-            calls += 1;
-            if calls <= 2 {
-                local(15, 23, 59, 59)
-            } else {
-                local(16, 0, 0, 1)
+        let mut times = times.into_iter();
+        let mut clock = move || times.next().expect("clock read more often than scripted");
+        let mut started_at = Vec::new();
+        let mut made = 1;
+        let mut new_dir_for = |t: chrono::DateTime<chrono::Local>| {
+            started_at.push(t);
+            if fail_new_sessions {
+                anyhow::bail!("disk full");
             }
+            made += 1;
+            Ok(root.join(format!("day{made}")))
         };
         let summary = record(
             consumer,
             info,
             root.join("day1"),
             Some(db),
+            None,
             &mut clock,
-            new_dir_for,
+            &mut new_dir_for,
             tx,
             jobs,
             stop,
         )
         .unwrap();
-        (summary, rx.try_iter().collect())
+        Recorded {
+            summary,
+            statuses: rx.try_iter().collect(),
+            started_at,
+        }
     }
 
-    #[test]
-    fn crossing_midnight_starts_a_second_session_in_its_own_directory() {
-        let root = scratch_dir("midnight");
+    fn fresh_root(name: &str) -> (PathBuf, PathBuf) {
+        let root = scratch_dir(name);
         std::fs::create_dir_all(&root).unwrap();
-        let db_path = root.join("test.db");
-        let day2 = root.join("day2");
-        let mut chose = None;
-        let mut new_dir_for = |t: chrono::DateTime<chrono::Local>| {
-            chose = Some(t);
-            Ok(day2.clone())
-        };
+        let db = root.join("test.db");
+        (root, db)
+    }
 
-        let (summary, statuses) =
-            record_across_midnight(&root, crate::db::open_at(&db_path).unwrap(), &mut new_dir_for);
-
-        assert_eq!(summary.sessions, vec![root.join("day1"), day2.clone()]);
-        assert_eq!(chose, Some(local(16, 0, 0, 1)));
-        for dir in &summary.sessions {
-            assert!(dir.join("meta.json").is_file(), "{} has no meta.json", dir.display());
-        }
-        let day2_meta: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(day2.join("meta.json")).unwrap()).unwrap();
-        assert_eq!(day2_meta["started"], local(16, 0, 0, 1).to_rfc3339());
-        let rolled: Vec<_> = statuses
+    fn rolled_to(r: &Recorded) -> Vec<PathBuf> {
+        r.statuses
             .iter()
             .filter_map(|s| match s {
                 Status::SessionStarted { dir } => Some(dir.clone()),
                 _ => None,
             })
-            .collect();
-        assert_eq!(rolled, vec![day2.clone()]);
+            .collect()
+    }
+
+    #[test]
+    fn speech_after_midnight_starts_a_second_session_in_its_own_directory() {
+        let (root, db_path) = fresh_root("midnight");
+        let script = [
+            speech(KEPT, local(15, 23, 59, 59)),
+            speech(KEPT, local(16, 0, 0, 1)),
+        ];
+
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+
+        let day2 = root.join("day2");
+        assert_eq!(r.summary.sessions, vec![root.join("day1"), day2.clone()]);
+        assert_eq!(r.started_at, vec![local(16, 0, 0, 1)]);
+        assert_eq!(rolled_to(&r), vec![day2.clone()]);
+        // The chunk open at midnight was closed into the first day.
+        assert_eq!(r.summary.chunks, 2);
+        for dir in &r.summary.sessions {
+            assert!(dir.join("meta.json").is_file(), "{} has no meta.json", dir.display());
+        }
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(day2.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["started"], local(16, 0, 0, 1).to_rfc3339());
 
         // Both sessions were registered in the index.
         let mut db = crate::db::open_at(&db_path).unwrap();
-        for dir in &summary.sessions {
-            db.record_chunk(dir, 0, "chunk-000.wav", 1.0, 0.0, 10).unwrap();
+        for dir in &r.summary.sessions {
+            db.record_chunk(dir, 99, "chunk-099.wav", 1.0, 0.0, 10).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An overnight with nobody talking must not leave an empty directory for the
+    /// new day: the session starts when speech does.
+    #[test]
+    fn midnight_in_silence_waits_for_speech_to_start_the_new_session() {
+        let (root, db_path) = fresh_root("midnight-quiet");
+        let script = [
+            speech(KEPT, local(15, 23, 50, 0)),
+            quiet(CUT, local(15, 23, 50, 5)),
+            quiet(1, local(16, 0, 5, 0)),
+        ];
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+        assert_eq!(r.summary.sessions, vec![root.join("day1")], "rolled with nobody talking");
+
+        let script = [
+            speech(KEPT, local(15, 23, 50, 0)),
+            quiet(CUT, local(15, 23, 50, 5)),
+            quiet(1, local(16, 0, 5, 0)),
+            speech(KEPT, local(16, 0, 10, 0)),
+        ];
+        let (root, db_path) = fresh_root("midnight-quiet-2");
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+        assert_eq!(r.summary.sessions, vec![root.join("day1"), root.join("day2")]);
+        assert_eq!(r.started_at, vec![local(16, 0, 10, 0)]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A failed rollover (disk full, say) must cost nothing: keep recording into
     /// the old directory and say so, rather than aborting a multi-day recording.
     #[test]
-    fn a_failed_midnight_rollover_keeps_recording_into_the_old_session() {
-        let root = scratch_dir("midnight-fail");
-        std::fs::create_dir_all(&root).unwrap();
-        let mut new_dir_for = |_| Err(anyhow::anyhow!("disk full"));
+    fn a_failed_rollover_keeps_recording_into_the_old_session() {
+        let (root, db_path) = fresh_root("midnight-fail");
+        let script = [
+            speech(KEPT, local(15, 23, 59, 59)),
+            speech(KEPT, local(16, 0, 0, 1)),
+        ];
 
-        let (summary, statuses) = record_across_midnight(
-            &root,
-            crate::db::open_at(&root.join("test.db")).unwrap(),
-            &mut new_dir_for,
-        );
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, true);
 
-        assert_eq!(summary.sessions, vec![root.join("day1")]);
-        assert!(statuses.iter().any(
+        assert_eq!(r.summary.sessions, vec![root.join("day1")]);
+        assert!(r.statuses.iter().any(
             |s| matches!(s, Status::Warning(m) if m.contains("still recording") && m.contains("disk full"))
         ));
-        assert!(!statuses.iter().any(|s| matches!(s, Status::SessionStarted { .. })));
+        assert!(rolled_to(&r).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn thirty_quiet_minutes_end_the_session_and_speech_starts_the_next() {
+        let (root, db_path) = fresh_root("idle");
+        let script = [
+            speech(KEPT, local(15, 10, 0, 0)),
+            quiet(CUT, local(15, 10, 0, 5)),
+            quiet(1, local(15, 10, 31, 0)),
+            speech(KEPT, local(15, 11, 0, 0)),
+        ];
+
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+
+        // The session is logged as starting when speech returned, not when the
+        // quiet ended or the process did.
+        assert_eq!(r.started_at, vec![local(15, 11, 0, 0)]);
+        assert_eq!(r.summary.sessions, vec![root.join("day1"), root.join("day2")]);
+        let idle_at = r
+            .statuses
+            .iter()
+            .position(|s| matches!(s, Status::SessionIdle))
+            .expect("the UI is told the session went idle");
+        let started_at = r
+            .statuses
+            .iter()
+            .position(|s| matches!(s, Status::SessionStarted { .. }))
+            .expect("a new session started");
+        assert!(idle_at < started_at);
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("day2").join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["started"], local(15, 11, 0, 0).to_rfc3339());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_shorter_pause_stays_in_the_same_session() {
+        let (root, db_path) = fresh_root("short-pause");
+        let script = [
+            speech(KEPT, local(15, 10, 0, 0)),
+            quiet(CUT, local(15, 10, 0, 5)),
+            speech(KEPT, local(15, 10, 29, 0)),
+        ];
+
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+
+        assert_eq!(r.summary.sessions, vec![root.join("day1")]);
+        assert!(!r.statuses.iter().any(|s| matches!(s, Status::SessionIdle)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Starting the recorder well before a meeting leaves a session with nothing
+    /// in it. When speech finally arrives that one is dropped, not kept as a
+    /// blank directory next to the real one.
+    #[test]
+    fn a_session_that_captured_nothing_is_discarded_when_the_next_one_starts() {
+        let (root, db_path) = fresh_root("empty");
+        let script = [
+            quiet(1, local(15, 10, 0, 0)),
+            quiet(1, local(15, 10, 31, 0)),
+            speech(KEPT, local(15, 11, 0, 0)),
+        ];
+
+        let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
+
+        assert_eq!(r.summary.sessions, vec![root.join("day2")]);
+        assert!(!root.join("day1").exists(), "empty session directory left behind");
+        let mut db = crate::db::open_at(&db_path).unwrap();
+        assert!(
+            db.record_chunk(&root.join("day1"), 0, "chunk-000.wav", 1.0, 0.0, 10).is_err(),
+            "empty session still in the index"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

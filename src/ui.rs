@@ -104,6 +104,8 @@ struct App {
     started: Instant,
     /// Directory of the session being recorded; changes at the midnight rollover.
     session_dir: String,
+    /// The session ended for want of speech; the next speech starts a new one.
+    idle: bool,
     system_rms: f32,
     mic_rms: f32,
     system_peak: Peak,
@@ -130,6 +132,7 @@ impl App {
         Self {
             started: now,
             session_dir: String::new(),
+            idle: false,
             system_rms: 0.0,
             mic_rms: 0.0,
             system_peak: Peak::default(),
@@ -198,11 +201,13 @@ impl App {
                 // A new day: the timer and chunk list describe the session on
                 // screen, and chunk numbers restart at zero.
                 self.session_dir = dir.display().to_string();
+                self.idle = false;
                 self.started = now;
                 self.current_index = 0;
                 self.current_started = now;
                 self.chunks.clear();
             }
+            Status::SessionIdle => self.idle = true,
             Status::Finished { .. } => self.finished = true,
             Status::TranscribeStarted { index } => self.transcribing = Some(index),
             Status::TranscribeDone {
@@ -360,7 +365,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let elapsed = app.started.elapsed();
     let mins = elapsed.as_secs() / 60;
     let secs = elapsed.as_secs() % 60;
-    let prefix = format!("meetrs · recording · {mins:02}:{secs:02} · ");
+    let state = if app.idle {
+        "idle, waiting for speech"
+    } else {
+        "recording"
+    };
+    let prefix = format!("meetrs · {state} · {mins:02}:{secs:02} · ");
     let budget = (area.width as usize).saturating_sub(prefix.len());
     let dir_shown = if dir_display.len() > budget && budget > 1 {
         // Truncate from the left — the tail (session id) is the useful part.
@@ -561,6 +571,24 @@ mod tests {
         assert!(app.chunks.is_empty());
         assert_eq!(app.current_index, 0);
         assert_eq!(app.started, later);
+    }
+
+    #[test]
+    fn an_idle_session_waits_for_speech_and_a_new_one_clears_that() {
+        let mut app = App::new();
+        let now = Instant::now();
+        assert!(!app.idle);
+
+        app.apply(Status::SessionIdle, now);
+        assert!(app.idle);
+
+        app.apply(
+            Status::SessionStarted {
+                dir: "/rec/2026-10-20T08-00-00".into(),
+            },
+            now,
+        );
+        assert!(!app.idle);
     }
 
     #[test]

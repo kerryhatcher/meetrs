@@ -45,6 +45,11 @@ pub fn silence_threshold() -> f32 {
         .unwrap_or(DEFAULT_SILENCE_RMS)
 }
 
+/// This much time with no speech on either leg ends the session; the next
+/// speech starts a new one. Measured on the wall clock, so a laptop that slept
+/// through the gap counts too.
+pub const IDLE_ROLLOVER: Duration = Duration::from_secs(30 * 60);
+
 /// A chunk shorter than this is discarded rather than written — a stray cough
 /// between two long pauses isn't worth a file.
 pub const MIN_CHUNK: Duration = Duration::from_millis(750);
@@ -97,9 +102,13 @@ pub enum Status {
     Overrun { dropped_samples: u64 },
     /// Non-fatal problem worth showing.
     Warning(String),
-    /// The recording rolled over at midnight: everything from here on is written
-    /// to `dir`, a new session. Chunk numbering and offsets restart from zero.
+    /// A new session began (after midnight or a long quiet stretch): everything
+    /// from here on is written to `dir`. Chunk numbering and offsets restart
+    /// from zero.
     SessionStarted { dir: PathBuf },
+    /// No speech for `IDLE_ROLLOVER`: the session is over and the next speech
+    /// starts a new one. Audio is still being listened to, just not written.
+    SessionIdle,
     /// Recording has stopped and all files are flushed.
     Finished { total_chunks: u32, total: Duration },
 
@@ -167,14 +176,9 @@ fn local_midnight(date: chrono::NaiveDate) -> chrono::DateTime<chrono::Local> {
         .expect("a local time within an hour of midnight exists")
 }
 
-/// The midnight at or before `t`: where `t`'s calendar day began.
-pub fn start_of_day(t: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
-    local_midnight(t.date_naive())
-}
-
-/// The first local midnight strictly after `t`. This is when a long-running
-/// recording rolls over into a new session, so each calendar day is logged on
-/// its own.
+/// The first local midnight strictly after `t`. A recording still going after
+/// this moment starts a new session at its next speech, so each calendar day is
+/// logged on its own.
 pub fn next_midnight(t: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
     local_midnight(t.date_naive() + chrono::Days::new(1))
 }
@@ -219,10 +223,5 @@ mod tests {
     #[test]
     fn next_midnight_is_strictly_after_midnight_itself() {
         assert_eq!(next_midnight(at(0, 0, 0)), next_day_midnight());
-    }
-
-    #[test]
-    fn start_of_day_is_the_midnight_before() {
-        assert_eq!(start_of_day(at(15, 45, 10)), at(0, 0, 0));
     }
 }

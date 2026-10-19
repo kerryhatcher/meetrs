@@ -26,3 +26,8 @@ target
 # Real captured audio kept for manual diarization checks. Never committed:
 # hundreds of MB of f32 WAV, and it is recorded meeting content.
 fixtures/
+
+# Ad-hoc transcript exports pulled from the db for personal use — recorded
+# meeting content, not project docs.
+/*-transcript.md
+/*-town-hall.md

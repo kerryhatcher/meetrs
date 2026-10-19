@@ -2,7 +2,10 @@
 //! soon as they land, so transcription of chunk N overlaps recording of chunk N+1.
 //!
 //! CONTRACT (do not change):
-//!   pub fn run(rx: mpsc::Receiver<Job>, model: PathBuf, dir: PathBuf, tx: mpsc::Sender<Status>) -> Result<()>
+//!   pub fn run(rx: mpsc::Receiver<Job>, model: PathBuf, tx: mpsc::Sender<Status>) -> Result<()>
+//!
+//! A job's session directory is the parent of its chunk file, so the worker
+//! follows the writer across the midnight rollover without being told.
 
 use crate::types::{Job, Status};
 use anyhow::{Context, Result};
@@ -332,7 +335,29 @@ fn fmt_timestamp(secs: f64) -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
-pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) -> Result<()> {
+/// What the worker holds for the session it is currently transcribing.
+struct SessionState {
+    dir: PathBuf,
+    meta: Option<SessionMeta>,
+    transcript_md: String,
+}
+
+/// The state for `job`'s session, starting a fresh one when the job came from a
+/// different directory than the last — the writer opens a new session at
+/// midnight, and jobs arrive in order, so the old one is finished for good.
+fn session_for<'a>(current: &'a mut Option<SessionState>, job: &Job) -> &'a mut SessionState {
+    let dir = job.path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    if current.as_ref().is_none_or(|s| s.dir != dir) {
+        *current = Some(SessionState {
+            dir,
+            meta: None,
+            transcript_md: String::new(),
+        });
+    }
+    current.as_mut().expect("set just above")
+}
+
+pub fn run(rx: Receiver<Job>, model: PathBuf, tx: Sender<Status>) -> Result<()> {
     // Own connection for this thread (WAL makes that safe). Best-effort: the
     // chunk-NNN.json files are authoritative, so a DB failure costs the index,
     // never a transcript. `meetrs --reindex` can repopulate.
@@ -373,8 +398,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
         )));
     }
 
-    let mut meta: Option<SessionMeta> = None;
-    let mut transcript_md = String::new();
+    let mut session: Option<SessionState> = None;
     let mut queue: VecDeque<Job> = VecDeque::new();
 
     loop {
@@ -392,12 +416,14 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
         let _ = tx.send(Status::TranscribeStarted { index: job.index });
         let started = Instant::now();
 
-        let session_meta = match &meta {
+        let state = session_for(&mut session, &job);
+        let dir = state.dir.clone();
+        let session_meta = match &state.meta {
             Some(m) => m,
             None => match load_session_meta(&dir) {
                 Ok(m) => {
-                    meta = Some(m);
-                    meta.as_ref().unwrap()
+                    state.meta = Some(m);
+                    state.meta.as_ref().unwrap()
                 }
                 Err(e) => {
                     let _ = tx.send(Status::TranscribeFailed {
@@ -441,7 +467,9 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                     let ts = fmt_timestamp(seg.start_secs);
                     let who = speaker_label(seg.leg, seg.turn);
                     let text = polish(&spell, &sentences, &seg.text);
-                    transcript_md.push_str(&format!("**[{ts}] {who}:** {text}\n\n"));
+                    state
+                        .transcript_md
+                        .push_str(&format!("**[{ts}] {who}:** {text}\n\n"));
                     lines.push(format!("[{ts}] {who}: {text}"));
                 }
                 if !lines.is_empty() {
@@ -450,7 +478,7 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
                         lines,
                     });
                 }
-                if let Err(e) = write_atomic(&dir.join("transcript.md"), transcript_md.as_bytes()) {
+                if let Err(e) = write_atomic(&dir.join("transcript.md"), state.transcript_md.as_bytes()) {
                     let _ = tx.send(Status::Warning(format!(
                         "transcript.md write failed after chunk {}: {e}",
                         job.index
@@ -506,6 +534,38 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, dir: PathBuf, tx: Sender<Status>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job_in(dir: &str, index: u32) -> Job {
+        Job {
+            path: PathBuf::from(dir).join(format!("chunk-{index:03}.wav")),
+            index,
+            offset: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn session_state_carries_on_within_one_directory() {
+        let mut current = None;
+        session_for(&mut current, &job_in("/rec/day1", 0))
+            .transcript_md
+            .push_str("hello\n");
+        let state = session_for(&mut current, &job_in("/rec/day1", 1));
+        assert_eq!(state.transcript_md, "hello\n");
+    }
+
+    /// The writer rolls into a new directory at midnight; the first job from it
+    /// must not inherit the previous day's transcript or channel map.
+    #[test]
+    fn session_state_resets_when_a_job_arrives_from_a_new_directory() {
+        let mut current = None;
+        session_for(&mut current, &job_in("/rec/day1", 7))
+            .transcript_md
+            .push_str("yesterday\n");
+        let state = session_for(&mut current, &job_in("/rec/day2", 0));
+        assert_eq!(state.dir, PathBuf::from("/rec/day2"));
+        assert!(state.transcript_md.is_empty());
+        assert!(state.meta.is_none());
+    }
 
     #[test]
     fn downmix_leg_averages_the_right_pair() {

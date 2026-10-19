@@ -139,13 +139,10 @@ fn main() -> Result<()> {
             .context("spawning writer thread")?
     };
 
-    let asr = {
-        let dir = dir.clone();
-        std::thread::Builder::new()
-            .name("meetrs-transcribe".into())
-            .spawn(move || transcribe::run(jobs_rx, model, dir, asr_tx))
-            .context("spawning transcribe thread")?
-    };
+    let asr = std::thread::Builder::new()
+        .name("meetrs-transcribe".into())
+        .spawn(move || transcribe::run(jobs_rx, model, asr_tx))
+        .context("spawning transcribe thread")?;
 
     let outcome = ui::run(rx, &dir, info, &stop);
 

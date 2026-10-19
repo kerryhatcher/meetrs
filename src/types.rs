@@ -148,7 +148,78 @@ pub fn recordings_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".meetrs").join("recordings"))
 }
 
+/// Local midnight on `date`. A zone whose clocks skip midnight (a DST gap)
+/// resolves to the first instant that exists after it.
+fn local_midnight(date: chrono::NaiveDate) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    let naive = date.and_hms_opt(0, 0, 0).expect("00:00:00 is a valid time");
+    chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| {
+            chrono::Local
+                .from_local_datetime(&(naive + chrono::Duration::hours(1)))
+                .earliest()
+        })
+        .expect("a local time within an hour of midnight exists")
+}
+
+/// The midnight at or before `t`: where `t`'s calendar day began.
+pub fn start_of_day(t: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
+    local_midnight(t.date_naive())
+}
+
+/// The first local midnight strictly after `t`. This is when a long-running
+/// recording rolls over into a new session, so each calendar day is logged on
+/// its own.
+pub fn next_midnight(t: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
+    local_midnight(t.date_naive() + chrono::Days::new(1))
+}
+
 /// Where a session's files live: `~/.meetrs/recordings/<rfc3339-ish timestamp>/`.
 pub fn session_dir(started: chrono::DateTime<chrono::Local>) -> anyhow::Result<PathBuf> {
     Ok(recordings_dir()?.join(started.format("%Y-%m-%dT%H-%M-%S").to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Local, NaiveDate, TimeZone};
+
+    fn at(h: u32, m: u32, s: u32) -> chrono::DateTime<Local> {
+        let naive = NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap();
+        Local.from_local_datetime(&naive).unwrap()
+    }
+
+    fn next_day_midnight() -> chrono::DateTime<Local> {
+        let naive = NaiveDate::from_ymd_opt(2026, 1, 16)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        Local.from_local_datetime(&naive).unwrap()
+    }
+
+    #[test]
+    fn next_midnight_from_midday_is_the_coming_midnight() {
+        assert_eq!(next_midnight(at(12, 30, 0)), next_day_midnight());
+    }
+
+    #[test]
+    fn next_midnight_one_second_early_is_one_second_away() {
+        assert_eq!(next_midnight(at(23, 59, 59)), next_day_midnight());
+    }
+
+    /// A session that starts exactly at 00:00:00 must not roll over instantly.
+    #[test]
+    fn next_midnight_is_strictly_after_midnight_itself() {
+        assert_eq!(next_midnight(at(0, 0, 0)), next_day_midnight());
+    }
+
+    #[test]
+    fn start_of_day_is_the_midnight_before() {
+        assert_eq!(start_of_day(at(15, 45, 10)), at(0, 0, 0));
+    }
 }

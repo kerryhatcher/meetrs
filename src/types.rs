@@ -97,6 +97,9 @@ pub enum Status {
     Overrun { dropped_samples: u64 },
     /// Non-fatal problem worth showing.
     Warning(String),
+    /// The recording rolled over at midnight: everything from here on is written
+    /// to `dir`, a new session. Chunk numbering and offsets restart from zero.
+    SessionStarted { dir: PathBuf },
     /// Recording has stopped and all files are flushed.
     Finished { total_chunks: u32, total: Duration },
 

@@ -3,10 +3,13 @@
 //! CONTRACT (do not change):
 //!   pub struct StopFlag; impl StopFlag { fn new() -> Self; fn stop(&self); fn stopped(&self) -> bool; }
 //!   impl Clone for StopFlag
-//!   pub struct Summary { pub chunks: u32, pub total: std::time::Duration }
+//!   pub struct Summary { pub chunks: u32, pub total: std::time::Duration, pub sessions: Vec<PathBuf> }
 //!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, jobs: mpsc::Sender<Job>, stop: StopFlag) -> Result<Summary>
 
-use crate::types::{CaptureInfo, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status};
+use crate::types::{
+    CaptureInfo, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status, next_midnight, session_dir,
+    start_of_day,
+};
 use crate::vad::Vad;
 use anyhow::Result;
 use serde::Serialize;
@@ -33,8 +36,12 @@ impl StopFlag {
 }
 
 pub struct Summary {
+    /// Kept chunks and audio across every session of the run, not just the last.
     pub chunks: u32,
     pub total: Duration,
+    /// Every session directory the run wrote, in order. A recording left running
+    /// past midnight spans more than one.
+    pub sessions: Vec<PathBuf>,
 }
 
 /// Result of feeding one frame-window into the silence state machine.
@@ -198,20 +205,99 @@ fn open_chunk(dir: &Path, index: u32, info: &CaptureInfo, offset: Duration) -> R
     })
 }
 
+/// Start a session in `dir`: create it, write an empty `meta.json` (the
+/// transcriber reads the channel map from it before any chunk exists), and
+/// register it in the index. Used for the first session and for each midnight
+/// rollover, so both come out identical.
+///
+/// The index is best-effort — `meta.json` is the source of truth — so a failure
+/// there warns and degrades rather than failing the session.
+fn begin_session(
+    dir: &Path,
+    started: chrono::DateTime<chrono::Local>,
+    info: &CaptureInfo,
+    threshold: f32,
+    detector: &str,
+    db: Option<&mut crate::db::Db>,
+    tx: &Sender<Status>,
+) -> Result<Meta> {
+    std::fs::create_dir_all(dir)?;
+    let meta = Meta {
+        started: started.to_rfc3339(),
+        sample_rate: info.sample_rate,
+        channels: info.channels,
+        system_channels: info.system_channels,
+        mic_channels: info.mic_channels,
+        silence_threshold_rms: threshold,
+        detector: detector.to_string(),
+        chunks: Vec::new(),
+    };
+    write_meta_atomic(dir, &meta)?;
+    if let Some(db) = db
+        && let Err(e) = db.start_session(dir, info, &meta.detector, &meta.started)
+    {
+        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+    }
+    Ok(meta)
+}
+
 pub fn run(
-    mut consumer: rtrb::Consumer<f32>,
+    consumer: rtrb::Consumer<f32>,
     info: CaptureInfo,
     dir: PathBuf,
     tx: Sender<Status>,
     jobs: Sender<Job>,
     stop: StopFlag,
 ) -> Result<Summary> {
-    std::fs::create_dir_all(&dir)?;
+    // The DB is a derived index; meta.json is the source of truth. So every DB
+    // call is best-effort: a failure warns and degrades to "no index", it never
+    // costs a recording. `db::rebuild()` can repopulate later.
+    let db = match crate::db::open() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            let _ = tx.send(Status::Warning(format!(
+                "db unavailable, not indexing: {e:#}"
+            )));
+            None
+        }
+    };
+    let mut clock = chrono::Local::now;
+    let mut new_dir_for = |day_start| session_dir(start_of_day(day_start));
+    record(
+        consumer,
+        info,
+        dir,
+        db,
+        &mut clock,
+        &mut new_dir_for,
+        tx,
+        jobs,
+        stop,
+    )
+}
+
+/// The writer loop behind [`run`], with the outside world passed in: `clock`
+/// says what time it is, `new_dir_for` picks the directory for the session that
+/// starts at the given time, and `db` is the index. That is what lets a test
+/// carry a recording across midnight without waiting for one or touching `$HOME`.
+#[allow(clippy::too_many_arguments)]
+fn record(
+    mut consumer: rtrb::Consumer<f32>,
+    info: CaptureInfo,
+    first_dir: PathBuf,
+    mut db: Option<crate::db::Db>,
+    clock: &mut dyn FnMut() -> chrono::DateTime<chrono::Local>,
+    new_dir_for: &mut dyn FnMut(chrono::DateTime<chrono::Local>) -> Result<PathBuf>,
+    tx: Sender<Status>,
+    jobs: Sender<Job>,
+    stop: StopFlag,
+) -> Result<Summary> {
+    let mut dir = first_dir;
 
     // Threshold is vestigial for chunking now (kept for the meta.json field and
     // as the fallback gate below); the VAD drives the actual cut decision.
     let threshold = crate::types::silence_threshold();
-    let started = chrono::Local::now();
+    let started = clock();
 
     // earshot's construction is pure computation (embedded model, no I/O), so
     // it shouldn't fail — but losing a whole recording because a VAD wouldn't
@@ -232,35 +318,25 @@ pub fn run(
         "rms-threshold-fallback".to_string()
     };
 
-    let mut meta = Meta {
-        started: started.to_rfc3339(),
-        sample_rate: info.sample_rate,
-        channels: info.channels,
-        system_channels: info.system_channels,
-        mic_channels: info.mic_channels,
-        silence_threshold_rms: threshold,
-        detector: detector_name,
-        chunks: Vec::new(),
-    };
-    write_meta_atomic(&dir, &meta)?;
+    let mut meta = begin_session(
+        &dir,
+        started,
+        &info,
+        threshold,
+        &detector_name,
+        db.as_mut(),
+        &tx,
+    )?;
 
-    // The DB is a derived index; meta.json above is the source of truth. So every
-    // DB call here is best-effort: a failure warns and degrades to "no index",
-    // it never costs a recording. `db::rebuild()` can repopulate later.
-    let mut db = match crate::db::open() {
-        Ok(mut d) => {
-            if let Err(e) = d.start_session(&dir, &info, &meta.detector, &meta.started) {
-                let _ = tx.send(Status::Warning(format!("db: {e:#}")));
-            }
-            Some(d)
-        }
-        Err(e) => {
-            let _ = tx.send(Status::Warning(format!(
-                "db unavailable, not indexing: {e:#}"
-            )));
-            None
-        }
-    };
+    // Each calendar day is its own session: a recording left running for days
+    // would otherwise mix every conversation into one log. See the rollover
+    // check at the top of the loop.
+    let mut rollover_at = next_midnight(started);
+    let mut sessions = vec![dir.clone()];
+    // Totals for sessions already closed by a rollover; `kept_chunks`/`total`
+    // below describe only the current session.
+    let mut closed_chunks: u32 = 0;
+    let mut closed_total = Duration::ZERO;
 
     let mut chunker = Chunker::new(info.sample_rate);
     // Last known per-leg speech decision — carried across batches so a batch
@@ -334,6 +410,77 @@ pub fn run(
         let frames = buf.len() / ch;
         if frames == 0 {
             continue;
+        }
+
+        // Midnight: close out the day's session and start the next one in its own
+        // directory, so this batch (and everything after) lands in the new day.
+        // The new session is created before the old one is touched, so a failure
+        // (disk full, say) leaves the recording running in the old directory
+        // rather than losing audio; it retries a minute later.
+        let now = clock();
+        if now >= rollover_at {
+            let begun = new_dir_for(now).and_then(|new_dir| {
+                let new_meta = begin_session(
+                    &new_dir,
+                    now,
+                    &info,
+                    threshold,
+                    &detector_name,
+                    db.as_mut(),
+                    &tx,
+                )?;
+                Ok((new_dir, new_meta))
+            });
+            match begun {
+                Err(e) => {
+                    let _ = tx.send(Status::Warning(format!(
+                        "could not start the new day's session, still recording into {}: {e:#}",
+                        dir.display()
+                    )));
+                    rollover_at = now + chrono::Duration::minutes(1);
+                }
+                Ok((new_dir, new_meta)) => {
+                    if let Some(mut oc) = current.take() {
+                        if !hold.is_empty() {
+                            write_samples(&mut oc, &hold)?;
+                        }
+                        finish_chunk(
+                            oc,
+                            &dir,
+                            &mut meta,
+                            &mut Sinks {
+                                tx: &tx,
+                                jobs: &jobs,
+                                db: db.as_mut(),
+                            },
+                            &mut kept_chunks,
+                            &mut total,
+                        )?;
+                    }
+                    hold.clear();
+                    preroll.clear();
+                    if let Some(db) = db.as_mut()
+                        && let Err(e) = db.finish_session(&dir, kept_chunks, total.as_secs_f64())
+                    {
+                        let _ = tx.send(Status::Warning(format!("db: {e:#}")));
+                    }
+                    closed_chunks += kept_chunks;
+                    closed_total += total;
+
+                    dir = new_dir;
+                    meta = new_meta;
+                    sessions.push(dir.clone());
+                    next_index = 0;
+                    kept_chunks = 0;
+                    total = Duration::ZERO;
+                    session_frames = 0;
+                    // The chunk just closed is over; if speech carries on, the
+                    // chunker reopens one in the new directory this same batch.
+                    chunker.reset_after_cut();
+                    rollover_at = next_midnight(now);
+                    let _ = tx.send(Status::SessionStarted { dir: dir.clone() });
+                }
+            }
         }
 
         let (sys_rms, sys_peak, mic_rms, mic_peak) = compute_levels(&buf, ch, &info);
@@ -469,14 +616,17 @@ pub fn run(
         let _ = tx.send(Status::Warning(format!("db: {e:#}")));
     }
 
+    let chunks = closed_chunks + kept_chunks;
+    let total = closed_total + total;
     let _ = tx.send(Status::Finished {
-        total_chunks: kept_chunks,
+        total_chunks: chunks,
         total,
     });
 
     Ok(Summary {
-        chunks: kept_chunks,
+        chunks,
         total,
+        sessions,
     })
 }
 
@@ -680,6 +830,173 @@ mod tests {
     fn loud_frames(c: &mut Chunker, secs: f64) -> Option<Cut> {
         let frames = (SR as f64 * secs) as u64;
         c.feed(true, frames)
+    }
+
+    fn test_info() -> CaptureInfo {
+        CaptureInfo {
+            channels: 4,
+            sample_rate: SR,
+            system_channels: (0, 1),
+            mic_channels: (2, 3),
+        }
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meetrs-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Both the first session and every midnight rollover go through here, so
+    /// the new day's directory has to come out complete: created, with a
+    /// `meta.json` the transcriber can read before any chunk exists.
+    #[test]
+    fn begin_session_creates_the_directory_with_an_empty_meta() {
+        let dir = scratch_dir("begin").join("2026-10-20T00-00-00");
+        let started = chrono::Local::now();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let meta = begin_session(&dir, started, &test_info(), 0.02, "earshot", None, &tx).unwrap();
+
+        assert_eq!(meta.started, started.to_rfc3339());
+        assert!(meta.chunks.is_empty());
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["started"], started.to_rfc3339());
+        assert_eq!(on_disk["channels"], 4);
+        assert_eq!(on_disk["chunks"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn begin_session_registers_the_session_in_the_index() {
+        let root = scratch_dir("begin-db");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut db = crate::db::open_at(&root.join("test.db")).unwrap();
+        let dir = root.join("2026-10-20T00-00-00");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        begin_session(&dir, chrono::Local::now(), &test_info(), 0.02, "earshot", Some(&mut db), &tx)
+            .unwrap();
+
+        // A closed chunk can only be recorded against a registered session.
+        db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10).unwrap();
+        assert!(rx.try_recv().is_err(), "no warning expected");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn local(day: u32, h: u32, m: u32, s: u32) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDate::from_ymd_opt(2026, 1, day)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap();
+        chrono::Local.from_local_datetime(&naive).unwrap()
+    }
+
+    /// Drive `record` over three batches of silence on a clock that reads
+    /// 23:59:59 for the start and first batch, then 00:00:01 the next day.
+    /// `new_dir_for` is the next-session directory chooser under test.
+    fn record_across_midnight(
+        root: &Path,
+        db: crate::db::Db,
+        new_dir_for: &mut dyn FnMut(chrono::DateTime<chrono::Local>) -> Result<PathBuf>,
+    ) -> (Summary, Vec<Status>) {
+        let info = test_info();
+        let batch_samples = 4096 * info.channels as usize;
+        let (mut producer, consumer) = rtrb::RingBuffer::new(batch_samples * 3);
+        for _ in 0..batch_samples * 3 {
+            producer.push(0.0).unwrap();
+        }
+        let stop = StopFlag::new();
+        stop.stop(); // drain what is queued, then finish
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (jobs, _jobs_rx) = std::sync::mpsc::channel();
+
+        let mut calls = 0;
+        let mut clock = move || {
+            calls += 1;
+            if calls <= 2 {
+                local(15, 23, 59, 59)
+            } else {
+                local(16, 0, 0, 1)
+            }
+        };
+        let summary = record(
+            consumer,
+            info,
+            root.join("day1"),
+            Some(db),
+            &mut clock,
+            new_dir_for,
+            tx,
+            jobs,
+            stop,
+        )
+        .unwrap();
+        (summary, rx.try_iter().collect())
+    }
+
+    #[test]
+    fn crossing_midnight_starts_a_second_session_in_its_own_directory() {
+        let root = scratch_dir("midnight");
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("test.db");
+        let day2 = root.join("day2");
+        let mut chose = None;
+        let mut new_dir_for = |t: chrono::DateTime<chrono::Local>| {
+            chose = Some(t);
+            Ok(day2.clone())
+        };
+
+        let (summary, statuses) =
+            record_across_midnight(&root, crate::db::open_at(&db_path).unwrap(), &mut new_dir_for);
+
+        assert_eq!(summary.sessions, vec![root.join("day1"), day2.clone()]);
+        assert_eq!(chose, Some(local(16, 0, 0, 1)));
+        for dir in &summary.sessions {
+            assert!(dir.join("meta.json").is_file(), "{} has no meta.json", dir.display());
+        }
+        let day2_meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(day2.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(day2_meta["started"], local(16, 0, 0, 1).to_rfc3339());
+        let rolled: Vec<_> = statuses
+            .iter()
+            .filter_map(|s| match s {
+                Status::SessionStarted { dir } => Some(dir.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rolled, vec![day2.clone()]);
+
+        // Both sessions were registered in the index.
+        let mut db = crate::db::open_at(&db_path).unwrap();
+        for dir in &summary.sessions {
+            db.record_chunk(dir, 0, "chunk-000.wav", 1.0, 0.0, 10).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A failed rollover (disk full, say) must cost nothing: keep recording into
+    /// the old directory and say so, rather than aborting a multi-day recording.
+    #[test]
+    fn a_failed_midnight_rollover_keeps_recording_into_the_old_session() {
+        let root = scratch_dir("midnight-fail");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut new_dir_for = |_| Err(anyhow::anyhow!("disk full"));
+
+        let (summary, statuses) = record_across_midnight(
+            &root,
+            crate::db::open_at(&root.join("test.db")).unwrap(),
+            &mut new_dir_for,
+        );
+
+        assert_eq!(summary.sessions, vec![root.join("day1")]);
+        assert!(statuses.iter().any(
+            |s| matches!(s, Status::Warning(m) if m.contains("still recording") && m.contains("disk full"))
+        ));
+        assert!(!statuses.iter().any(|s| matches!(s, Status::SessionStarted { .. })));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

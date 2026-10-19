@@ -102,6 +102,8 @@ impl Peak {
 
 struct App {
     started: Instant,
+    /// Directory of the session being recorded; changes at the midnight rollover.
+    session_dir: String,
     system_rms: f32,
     mic_rms: f32,
     system_peak: Peak,
@@ -127,6 +129,7 @@ impl App {
         let now = Instant::now();
         Self {
             started: now,
+            session_dir: String::new(),
             system_rms: 0.0,
             mic_rms: 0.0,
             system_peak: Peak::default(),
@@ -191,6 +194,15 @@ impl App {
                 self.warnings += 1;
                 self.last_warning = Some(msg);
             }
+            Status::SessionStarted { dir } => {
+                // A new day: the timer and chunk list describe the session on
+                // screen, and chunk numbers restart at zero.
+                self.session_dir = dir.display().to_string();
+                self.started = now;
+                self.current_index = 0;
+                self.current_started = now;
+                self.chunks.clear();
+            }
             Status::Finished { .. } => self.finished = true,
             Status::TranscribeStarted { index } => self.transcribing = Some(index),
             Status::TranscribeDone {
@@ -239,10 +251,10 @@ pub fn run(rx: Receiver<Status>, dir: &Path, _info: CaptureInfo, stop: &StopFlag
     // unwinding, and try_restore() below is idempotent (safe to call even if
     // already restored) — no need to hand-roll either.
     let mut terminal = ratatui::try_init()?;
-    let dir_display = dir.display().to_string();
     let mut app = App::new();
+    app.session_dir = dir.display().to_string();
 
-    let result = event_loop(&mut terminal, &mut app, &rx, &dir_display, stop);
+    let result = event_loop(&mut terminal, &mut app, &rx, stop);
 
     ratatui::try_restore()?;
     result
@@ -252,7 +264,6 @@ fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     rx: &Receiver<Status>,
-    dir_display: &str,
     stop: &StopFlag,
 ) -> Result<()> {
     loop {
@@ -270,7 +281,7 @@ fn event_loop(
             }
         }
 
-        terminal.draw(|frame| draw(frame, app, dir_display, now))?;
+        terminal.draw(|frame| draw(frame, app, now))?;
 
         if crossterm::event::poll(TICK)? {
             use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -287,7 +298,7 @@ fn event_loop(
     }
 }
 
-fn draw(frame: &mut Frame, app: &mut App, dir_display: &str, now: Instant) {
+fn draw(frame: &mut Frame, app: &mut App, now: Instant) {
     let area = frame.area();
 
     // ponytail: below this, don't even try to lay out sub-widgets — a single
@@ -327,7 +338,7 @@ fn draw(frame: &mut Frame, app: &mut App, dir_display: &str, now: Instant) {
         .split(area);
 
     let mut idx = 0;
-    draw_header(frame, rows[idx], app, dir_display);
+    draw_header(frame, rows[idx], app);
     idx += 1;
     draw_meters(frame, rows[idx], app, now);
     idx += 1;
@@ -344,7 +355,8 @@ fn draw(frame: &mut Frame, app: &mut App, dir_display: &str, now: Instant) {
     draw_footer(frame, rows[idx]);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App, dir_display: &str) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let dir_display = app.session_dir.as_str();
     let elapsed = app.started.elapsed();
     let mins = elapsed.as_secs() / 60;
     let secs = elapsed.as_secs() % 60;
@@ -519,6 +531,36 @@ mod tests {
         // Newest chunk on top, and within a chunk the segments stay in the
         // order they were spoken.
         assert_eq!(transcript(&app), vec!["b1", "b2", "a1", "a2"]);
+    }
+
+    #[test]
+    fn a_new_session_points_the_header_at_it_and_restarts_the_chunk_list() {
+        let mut app = App::new();
+        let now = Instant::now();
+        app.session_dir = "/rec/2026-10-19T09-00-00".into();
+        app.apply(
+            Status::ChunkClosed {
+                path: "/rec/2026-10-19T09-00-00/chunk-041.wav".into(),
+                index: 41,
+                duration: Duration::from_secs(30),
+                bytes: 1,
+            },
+            now,
+        );
+        app.current_index = 42;
+
+        let later = now + Duration::from_secs(3600);
+        app.apply(
+            Status::SessionStarted {
+                dir: "/rec/2026-10-20T00-00-00".into(),
+            },
+            later,
+        );
+
+        assert_eq!(app.session_dir, "/rec/2026-10-20T00-00-00");
+        assert!(app.chunks.is_empty());
+        assert_eq!(app.current_index, 0);
+        assert_eq!(app.started, later);
     }
 
     #[test]

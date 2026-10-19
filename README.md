@@ -90,6 +90,13 @@ Recordings land in `~/.meetrs/recordings/<timestamp>/`:
   transcript.md      speaker-labelled, human-readable
 ```
 
+A recording left running past midnight rolls over: at 00:00 local time the current
+chunk is closed and a new session starts in its own directory
+(`2026-08-04T00-00-00`), with chunk numbers and transcript timestamps starting
+again from zero. Each calendar day gets its own `transcript.md`, and the full-text
+index treats them as separate sessions. (If the machine slept through midnight,
+the rollover happens when audio resumes, in the directory for that day.)
+
 State and a full-text index live in a SQLite database at `~/.meetrs/meetrs.db`.
 
 `transcript.md` looks like this:

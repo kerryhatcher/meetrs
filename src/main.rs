@@ -184,12 +184,16 @@ fn main() -> Result<()> {
     // out, some chunk may still need its float WAV for a retry, so the audio
     // stays exactly as recorded.
     if transcribed_cleanly {
-        compress_session(&dir);
+        for session in &summary.sessions {
+            compress_session(session);
+        }
     } else {
         eprintln!("skipping compression: chunks may still need re-transcribing");
     }
 
-    println!("{}", dir.display());
+    for session in &summary.sessions {
+        println!("{}", session.display());
+    }
     Ok(())
 }
 

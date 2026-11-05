@@ -63,6 +63,9 @@ fn default_interval_secs() -> u64 {
 
 /// Smallest `max_chunk_secs` allowed. Shorter chunks would cut speech mid-word.
 const MIN_MAX_CHUNK_SECS: f64 = 10.0;
+/// Largest `max_chunk_secs` allowed: a day. Larger values overflow the Duration
+/// conversion, and no recording needs a single chunk that long.
+const MAX_MAX_CHUNK_SECS: f64 = 86_400.0;
 /// Smallest `max_chunk_bytes` allowed. It has to hold more than the one second
 /// of frames the chunker keeps back, so the limit is never reached by silence alone.
 const MIN_MAX_CHUNK_BYTES: u64 = 10_000_000;
@@ -168,11 +171,14 @@ fn load_or_create(path: &Path) -> Result<Config> {
 /// appended, and only at the end of the file. The new text is parsed before
 /// anything is written, so a file that would not load is left untouched.
 fn add_missing_keys(path: &Path, text: &str, cfg: Config) -> Result<Config> {
+    // Looked up in the text, not the parsed value: a key that is present but empty
+    // (`max_chunk_secs:`) parses to None, and appending it again would make the
+    // file fail to load.
     let mut add = String::new();
-    if cfg.max_chunk_secs.is_none() {
+    if !defines_key(text, "max_chunk_secs") {
         add.push_str(MAX_CHUNK_SECS_BLOCK);
     }
-    if cfg.max_chunk_bytes.is_none() {
+    if !defines_key(text, "max_chunk_bytes") {
         if !add.is_empty() {
             add.push('\n');
         }
@@ -188,7 +194,15 @@ fn add_missing_keys(path: &Path, text: &str, cfg: Config) -> Result<Config> {
         "\n"
     };
     let combined = format!("{text}{gap}\n{add}");
-    let updated = parse(&combined, path)?;
+    // A file that is not a plain mapping (a flow mapping, say) cannot take appended
+    // lines. Leave it alone and run on the defaults, rather than refuse to start.
+    let Ok(updated) = parse(&combined, path) else {
+        eprintln!(
+            "meetrs: warning: {} is not a plain YAML mapping, so chunk settings were not added",
+            path.display()
+        );
+        return Ok(cfg);
+    };
 
     let written = OpenOptions::new()
         .append(true)
@@ -224,6 +238,14 @@ fn create_template(path: &Path) -> Result<()> {
     }
 }
 
+/// Whether the document has a top-level key `key`, whatever its value.
+fn defines_key(text: &str, key: &str) -> bool {
+    serde_yaml_ng::from_str::<Option<serde_yaml_ng::Mapping>>(text)
+        .ok()
+        .flatten()
+        .is_some_and(|m| m.keys().any(|k| k.as_str() == Some(key)))
+}
+
 fn parse(text: &str, path: &Path) -> Result<Config> {
     // `Option` so a file with only comments (an empty YAML document) is valid and
     // means "all defaults", rather than an error about a missing mapping.
@@ -232,8 +254,8 @@ fn parse(text: &str, path: &Path) -> Result<Config> {
         .unwrap_or_default();
     if let Some(secs) = cfg.max_chunk_secs {
         anyhow::ensure!(
-            secs.is_finite() && secs >= MIN_MAX_CHUNK_SECS,
-            "{}: max_chunk_secs must be at least {MIN_MAX_CHUNK_SECS}, got {secs}",
+            secs.is_finite() && (MIN_MAX_CHUNK_SECS..=MAX_MAX_CHUNK_SECS).contains(&secs),
+            "{}: max_chunk_secs must be between {MIN_MAX_CHUNK_SECS} and {MAX_MAX_CHUNK_SECS}, got {secs}",
             path.display()
         );
     }
@@ -259,6 +281,11 @@ fn parse(text: &str, path: &Path) -> Result<Config> {
         anyhow::ensure!(
             !account.is_empty(),
             "{}: upload.r2.account_id is required when upload.r2 is enabled",
+            path.display()
+        );
+        anyhow::ensure!(
+            account.len() == 32 && account.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{}: upload.r2.account_id must be the 32-character hex id from the Cloudflare dashboard",
             path.display()
         );
         let bucket = r2.bucket.as_deref().unwrap_or("").trim();
@@ -402,13 +429,14 @@ mod tests {
     fn enabled_upload_needs_account_and_bucket() {
         let no_account = "upload:\n  r2:\n    enabled: true\n    bucket: hatcher-meetrs\n";
         assert!(parse(no_account, Path::new("x")).is_err());
-        let no_bucket = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n";
+        let no_bucket =
+            "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n";
         assert!(parse(no_bucket, Path::new("x")).is_err());
     }
 
     #[test]
     fn enabled_upload_with_full_settings_parses() {
-        let text = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n    prefix: meetings/\n";
+        let text = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: hatcher-meetrs\n    prefix: meetings/\n";
         let cfg = parse(text, Path::new("x")).unwrap();
         assert!(cfg.upload.r2.enabled);
         assert_eq!(cfg.upload.r2.bucket.as_deref(), Some("hatcher-meetrs"));
@@ -417,20 +445,51 @@ mod tests {
 
     #[test]
     fn enabled_upload_rejects_a_bad_bucket_name() {
-        let text = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: Bad_Name\n";
+        let text = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: Bad_Name\n";
         assert!(parse(text, Path::new("x")).is_err());
     }
 
     #[test]
     fn upload_interval_defaults_to_five_minutes_and_has_a_floor() {
-        let on =
-            "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n";
+        let on = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: hatcher-meetrs\n";
         assert_eq!(
             parse(on, Path::new("x")).unwrap().upload.r2.interval_secs,
             300
         );
         let too_fast = format!("{on}    interval_secs: 5\n");
         assert!(parse(&too_fast, Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn an_empty_chunk_key_is_not_appended_a_second_time() {
+        // `max_chunk_secs:` with no value is present, so it must not be added again.
+        let path = scratch("empty-key");
+        std::fs::write(&path, "max_chunk_secs:\nmax_chunk_bytes: 50000000\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        load_or_create(&path).expect("an empty key must not break the file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_flow_mapping_file_still_starts_and_is_left_alone() {
+        let path = scratch("flow");
+        let text = "{silence_rms: 0.03}\n";
+        std::fs::write(&path, text).unwrap();
+        let cfg = load_or_create(&path).expect("must still start");
+        assert_eq!(cfg.silence_rms, Some(0.03));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn chunk_secs_above_a_day_is_rejected() {
+        assert!(parse("max_chunk_secs: 1e300\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_secs: 86400\n", Path::new("x")).is_ok());
+    }
+
+    #[test]
+    fn account_id_must_be_32_hex_digits() {
+        let bad = "upload:\n  r2:\n    enabled: true\n    account_id: abc/def\n    bucket: hatcher-meetrs\n";
+        assert!(parse(bad, Path::new("x")).is_err());
     }
 
     #[test]

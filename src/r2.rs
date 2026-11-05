@@ -126,7 +126,14 @@ pub type Sent = HashMap<PathBuf, Stamp>;
 
 impl Uploader {
     pub fn new(target: Target, creds: Credentials) -> Self {
+        // Same reason as model.rs: ureq 3 defaults to Rustls even when only
+        // native-tls is compiled in, and panics at request time.
         let agent = ureq::Agent::config_builder()
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .provider(ureq::tls::TlsProvider::NativeTls)
+                    .build(),
+            )
             .timeout_global(Some(REQUEST_TIMEOUT))
             .build()
             .into();

@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("--search") => return search(&args[1..].join(" ")),
         Some("--reindex") => return reindex(),
+        Some("--upload") => return upload_old(&args[1..]),
         _ => {}
     }
 
@@ -321,12 +322,79 @@ fn uploader_from_config() -> Result<Option<r2::Uploader>> {
             return Ok(None);
         }
     };
-    let target = r2::Target::new(
+    Ok(Some(r2::Uploader::new(r2_target(cfg), creds)))
+}
+
+fn r2_target(cfg: &config::R2Upload) -> r2::Target {
+    r2::Target::new(
         cfg.account_id.as_deref().unwrap_or(""),
         cfg.bucket.as_deref().unwrap_or(""),
         &cfg.prefix,
+    )
+}
+
+/// `--upload [dir...]`: send session directories to R2 now, the same way the
+/// recorder does during and after a run. With no arguments it sends every
+/// session under `~/.meetrs/recordings`. Unlike recording, this is explicit, so
+/// a missing setting is an error rather than a warning. Read-only on the local
+/// files, so it takes no lock.
+fn upload_old(dirs: &[String]) -> Result<()> {
+    let cfg = &config::get().upload.r2;
+    anyhow::ensure!(
+        cfg.enabled,
+        "upload.r2 is not enabled in {}",
+        config::path()?.display()
     );
-    Ok(Some(r2::Uploader::new(target, creds)))
+    let creds = r2::Credentials::from_env().context("R2 credentials are needed to upload")?;
+    let uploader = r2::Uploader::new(r2_target(cfg), creds);
+
+    let sessions: Vec<std::path::PathBuf> = if dirs.is_empty() {
+        compress::sessions()?
+    } else {
+        dirs.iter().map(std::path::PathBuf::from).collect()
+    };
+    if sessions.is_empty() {
+        println!("no sessions to upload");
+        return Ok(());
+    }
+    println!(
+        "uploading {} session(s) to r2://{}/{}",
+        sessions.len(),
+        cfg.bucket.as_deref().unwrap_or(""),
+        cfg.prefix
+    );
+
+    // One session at a time so progress shows on a long backfill. The map is
+    // shared across them, so a file that appears twice is still sent once.
+    let mut sent = r2::Sent::new();
+    let mut failures = 0usize;
+    for (i, dir) in sessions.iter().enumerate() {
+        let before = sent.len();
+        let errors = uploader.upload_pass(std::slice::from_ref(dir), None, &mut sent);
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        println!(
+            "[{}/{}] {}: {} file(s){}",
+            i + 1,
+            sessions.len(),
+            name.unwrap_or_else(|| dir.display().to_string()),
+            sent.len() - before,
+            if errors.is_empty() {
+                ""
+            } else {
+                " (with errors)"
+            }
+        );
+        for e in &errors {
+            eprintln!("meetrs: {e}");
+        }
+        failures += errors.len();
+    }
+    println!("sent {} file(s); {failures} error(s)", sent.len());
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} upload error(s); re-run to retry them"
+    );
+    Ok(())
 }
 
 /// Final upload after the recording and compression are done. Anything the

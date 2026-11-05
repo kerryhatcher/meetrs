@@ -78,6 +78,13 @@ reindex: bundle
 # Deletes a chunk's WAV only after its FLAC verifies; untranscribed chunks are
 # left alone. New sessions compress themselves at session end.
 #
+# upload sessions to R2 now, with the credentials from SOPS: just upload [session-dir...]
+upload *DIRS: bundle
+    #!/usr/bin/env bash
+    secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
+    [ -f "$secrets" ] || { echo "no credentials file at $secrets" >&2; exit 1; }
+    exec sops exec-env "$secrets" "\"{{exe}}\" --upload {{DIRS}}"
+
 # compress older sessions to FLAC: just compress [session-dir...]
 compress *DIRS: bundle
     exec "{{exe}}" --compress {{DIRS}}

@@ -81,8 +81,8 @@ fn main() -> Result<()> {
         return check();
     }
 
-    // Built before anything is recorded, so a missing credential is reported
-    // now rather than after a long session has already been captured.
+    // Built before anything is recorded. A missing credential only switches
+    // uploads off, with a warning: the recording matters more than the copy.
     let uploader = uploader_from_config()?.map(std::sync::Arc::new);
 
     // Fail before touching the terminal, so errors are readable.
@@ -306,18 +306,26 @@ fn compress_old(dirs: &[String]) -> Result<()> {
 }
 
 /// The R2 uploader, if `upload.r2` is enabled in the config. Credentials come
-/// from the environment, so a missing one is an error here, at startup.
+/// from the environment. When they are missing, uploads are switched off with a
+/// warning and recording goes ahead. Problems in the config file itself are
+/// still fatal, since those are mistakes the user made in writing it.
 fn uploader_from_config() -> Result<Option<r2::Uploader>> {
     let cfg = &config::get().upload.r2;
     if !cfg.enabled {
         return Ok(None);
     }
+    let creds = match r2::Credentials::from_env() {
+        Ok(creds) => creds,
+        Err(e) => {
+            eprintln!("meetrs: warning: R2 upload is off, recording without it ({e:#})");
+            return Ok(None);
+        }
+    };
     let target = r2::Target::new(
         cfg.account_id.as_deref().unwrap_or(""),
         cfg.bucket.as_deref().unwrap_or(""),
         &cfg.prefix,
     );
-    let creds = r2::Credentials::from_env().context("upload.r2 is enabled")?;
     Ok(Some(r2::Uploader::new(target, creds)))
 }
 

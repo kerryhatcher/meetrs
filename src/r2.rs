@@ -46,7 +46,10 @@ impl std::fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
-            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -275,8 +278,7 @@ pub fn newest_wav(dir: &Path) -> Option<PathBuf> {
     session_files(dir)
         .ok()?
         .into_iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
-        .last()
+        .rfind(|p| p.extension().is_some_and(|e| e == "wav"))
 }
 
 /// Session directories under `root` whose names sort at or after `since`,
@@ -343,12 +345,9 @@ pub fn spawn_periodic(
         .spawn(move || {
             let mut sent = Sent::new();
             let mut errors = Vec::new();
-            loop {
-                match stop_rx.recv_timeout(interval) {
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    // The sender was dropped by `finish`, or a message arrived.
-                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
+            // Any outcome other than a timeout means stop: the sender was dropped
+            // by `finish`, or a message arrived.
+            while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
                 let sessions = sessions_since(&root, &since);
                 // The newest session is the one being recorded. Earlier ones
                 // have closed, so every file in them is final.
@@ -400,16 +399,12 @@ pub fn sign_put(
     // SigV4 wants the canonical header names sorted.
     signed.sort_by(|a, b| a.0.cmp(b.0));
 
-    let canonical_headers: String = signed
-        .iter()
-        .map(|(n, v)| format!("{n}:{v}\n"))
-        .collect();
+    let canonical_headers: String = signed.iter().map(|(n, v)| format!("{n}:{v}\n")).collect();
     let signed_names: Vec<&str> = signed.iter().map(|(n, _)| *n).collect();
     let signed_list = signed_names.join(";");
 
-    let canonical_request = format!(
-        "PUT\n{uri_path}\n\n{canonical_headers}\n{signed_list}\n{payload_sha256_hex}"
-    );
+    let canonical_request =
+        format!("PUT\n{uri_path}\n\n{canonical_headers}\n{signed_list}\n{payload_sha256_hex}");
     let scope = format!("{date_stamp}/{REGION}/s3/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
@@ -550,7 +545,11 @@ mod tests {
             "20261105T090000Z",
             "20261105",
         );
-        let auth = &headers.iter().find(|(n, _)| n == "authorization").unwrap().1;
+        let auth = &headers
+            .iter()
+            .find(|(n, _)| n == "authorization")
+            .unwrap()
+            .1;
         assert_eq!(
             auth,
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261105/auto/s3/aws4_request, \
@@ -567,15 +566,30 @@ mod tests {
             session_token: Some("tok".into()),
         };
         let headers = sign_put(&creds, "h", "/b/k", "00", "20260101T000000Z", "20260101");
-        let auth = &headers.iter().find(|(n, _)| n == "authorization").unwrap().1;
-        assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"));
-        assert!(headers.iter().any(|(n, v)| n == "x-amz-security-token" && v == "tok"));
+        let auth = &headers
+            .iter()
+            .find(|(n, _)| n == "authorization")
+            .unwrap()
+            .1;
+        assert!(
+            auth.contains(
+                "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            )
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "x-amz-security-token" && v == "tok")
+        );
     }
 
     #[test]
     fn keys_are_percent_encoded_but_keep_slashes() {
         assert_eq!(encode_path("a b/c+d.flac"), "a%20b/c%2Bd.flac");
-        assert_eq!(encode_path("2026-11-05T09-00-00/chunk-000.json"), "2026-11-05T09-00-00/chunk-000.json");
+        assert_eq!(
+            encode_path("2026-11-05T09-00-00/chunk-000.json"),
+            "2026-11-05T09-00-00/chunk-000.json"
+        );
     }
 
     #[test]
@@ -610,7 +624,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meetrs-r2-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["chunk-001.flac", "chunk-000.flac", "meta.json", ".meta.json.tmp"] {
+        for name in [
+            "chunk-001.flac",
+            "chunk-000.flac",
+            "meta.json",
+            ".meta.json.tmp",
+        ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let names: Vec<String> = session_files(&dir)

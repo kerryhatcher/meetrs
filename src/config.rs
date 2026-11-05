@@ -276,8 +276,12 @@ mod tests {
 
     #[test]
     fn upload_interval_defaults_to_five_minutes_and_has_a_floor() {
-        let on = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n";
-        assert_eq!(parse(on, Path::new("x")).unwrap().upload.r2.interval_secs, 300);
+        let on =
+            "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n";
+        assert_eq!(
+            parse(on, Path::new("x")).unwrap().upload.r2.interval_secs,
+            300
+        );
         let too_fast = format!("{on}    interval_secs: 5\n");
         assert!(parse(&too_fast, Path::new("x")).is_err());
     }

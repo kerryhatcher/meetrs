@@ -192,8 +192,8 @@ export MEETRS_R2_SECRET_ACCESS_KEY=...
 export MEETRS_R2_SESSION_TOKEN=...
 ```
 
-If `enabled` is true and a credential is missing, meetrs stops before recording
-starts. A failed upload is reported and retried on the next pass. The files stay
+If `enabled` is true and a credential is missing, meetrs prints a warning and
+records without uploading. A bad value in the config file still stops startup. A failed upload is reported and retried on the next pass. The files stay
 on disk, and uploads overwrite the same keys, so retrying is safe.
 
 Compressed sessions leave their original WAV objects in the bucket next to the

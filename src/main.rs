@@ -12,6 +12,7 @@ mod config;
 mod db;
 mod lock;
 mod model;
+mod r2;
 mod tcc;
 mod transcribe;
 mod types;
@@ -79,6 +80,10 @@ fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--check") {
         return check();
     }
+
+    // Built before anything is recorded, so a missing credential is reported
+    // now rather than after a long session has already been captured.
+    let uploader = uploader_from_config()?;
 
     // Fail before touching the terminal, so errors are readable.
     let started = chrono::Local::now();
@@ -197,6 +202,12 @@ fn main() -> Result<()> {
         eprintln!("skipping compression: chunks may still need re-transcribing");
     }
 
+    // Upload whatever is on disk, whether or not transcription finished: the
+    // audio is the part worth keeping off this machine.
+    if let Some(uploader) = &uploader {
+        upload_sessions(uploader, &summary.sessions);
+    }
+
     for session in &summary.sessions {
         println!("{}", session.display());
     }
@@ -259,6 +270,37 @@ fn compress_old(dirs: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The R2 uploader, if `upload.r2` is enabled in the config. Credentials come
+/// from the environment, so a missing one is an error here, at startup.
+fn uploader_from_config() -> Result<Option<r2::Uploader>> {
+    let cfg = &config::get().upload.r2;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let target = r2::Target::new(
+        cfg.account_id.as_deref().unwrap_or(""),
+        cfg.bucket.as_deref().unwrap_or(""),
+        &cfg.prefix,
+    );
+    let creds = r2::Credentials::from_env().context("upload.r2 is enabled")?;
+    Ok(Some(r2::Uploader::new(target, creds)))
+}
+
+/// Upload each session directory. A failure is reported and the next session is
+/// tried: the audio is still on disk, so nothing here can lose it.
+fn upload_sessions(uploader: &r2::Uploader, sessions: &[std::path::PathBuf]) {
+    for dir in sessions {
+        match uploader.upload_session(dir) {
+            Ok(n) => println!(
+                "uploaded {n} file(s) from {} to bucket {}",
+                dir.display(),
+                uploader.target.bucket
+            ),
+            Err(e) => eprintln!("meetrs: upload failed for {}: {e:#}", dir.display()),
+        }
+    }
 }
 
 /// Shrink the session's WAVs to FLAC. Recording and transcription are already

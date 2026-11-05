@@ -21,6 +21,30 @@ pub struct Config {
     /// chunking is driven by the VAD and ignores this. See
     /// `types::DEFAULT_SILENCE_RMS`.
     pub silence_rms: Option<f32>,
+    #[serde(default)]
+    pub upload: Upload,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upload {
+    #[serde(default)]
+    pub r2: R2Upload,
+}
+
+/// Upload finished sessions to a Cloudflare R2 bucket. Credentials are never
+/// read from this file; see `r2::Credentials::from_env`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct R2Upload {
+    /// Off unless set. Nothing else in this section is checked when it is off.
+    #[serde(default)]
+    pub enabled: bool,
+    pub account_id: Option<String>,
+    pub bucket: Option<String>,
+    /// Key prefix inside the bucket, e.g. `meetings/`. Empty means the bucket root.
+    #[serde(default)]
+    pub prefix: String,
 }
 
 /// What gets written on first run. Everything is commented out, so the file
@@ -37,6 +61,17 @@ const TEMPLATE: &str = "\
 # when the voice-activity detector fails to load and meetrs falls back to a
 # plain volume threshold. Normal operation ignores it.
 # silence_rms: 0.02
+
+# Upload each session's files to a Cloudflare R2 bucket once it has been
+# transcribed and compressed. Keys look like <prefix><session>/<file>. The
+# access key goes in the environment, never in this file:
+#   MEETRS_R2_ACCESS_KEY_ID, MEETRS_R2_SECRET_ACCESS_KEY
+# upload:
+#   r2:
+#     enabled: false
+#     account_id: <your Cloudflare account id>
+#     bucket: <bucket name>
+#     prefix: ''
 ";
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -106,6 +141,25 @@ fn parse(text: &str, path: &Path) -> Result<Config> {
             path.display()
         );
     }
+    let r2 = &cfg.upload.r2;
+    if r2.enabled {
+        // Only checked when enabled, so a half-filled section costs nothing
+        // until the user turns it on.
+        let account = r2.account_id.as_deref().unwrap_or("").trim();
+        anyhow::ensure!(
+            !account.is_empty(),
+            "{}: upload.r2.account_id is required when upload.r2 is enabled",
+            path.display()
+        );
+        let bucket = r2.bucket.as_deref().unwrap_or("").trim();
+        anyhow::ensure!(
+            !bucket.is_empty(),
+            "{}: upload.r2.bucket is required when upload.r2 is enabled",
+            path.display()
+        );
+        crate::r2::check_bucket_name(bucket)
+            .with_context(|| format!("{}: upload.r2.bucket", path.display()))?;
+    }
     Ok(cfg)
 }
 
@@ -173,6 +227,35 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn upload_is_off_and_unchecked_by_default() {
+        let cfg = parse("upload:\n  r2:\n    bucket: NOT VALID\n", Path::new("x")).unwrap();
+        assert!(!cfg.upload.r2.enabled);
+    }
+
+    #[test]
+    fn enabled_upload_needs_account_and_bucket() {
+        let no_account = "upload:\n  r2:\n    enabled: true\n    bucket: hatcher-meetrs\n";
+        assert!(parse(no_account, Path::new("x")).is_err());
+        let no_bucket = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n";
+        assert!(parse(no_bucket, Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn enabled_upload_with_full_settings_parses() {
+        let text = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n    prefix: meetings/\n";
+        let cfg = parse(text, Path::new("x")).unwrap();
+        assert!(cfg.upload.r2.enabled);
+        assert_eq!(cfg.upload.r2.bucket.as_deref(), Some("hatcher-meetrs"));
+        assert_eq!(cfg.upload.r2.prefix, "meetings/");
+    }
+
+    #[test]
+    fn enabled_upload_rejects_a_bad_bucket_name() {
+        let text = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: Bad_Name\n";
+        assert!(parse(text, Path::new("x")).is_err());
     }
 
     #[test]

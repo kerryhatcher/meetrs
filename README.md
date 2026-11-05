@@ -165,6 +165,34 @@ key or a malformed value stops startup and names the file and the problem.
 |---|---|---|
 | `silence_rms` | `0.02` | RMS threshold for the fallback path only (see above). Overridden by `MEETRS_SILENCE_RMS`. |
 
+### Uploading to Cloudflare R2
+
+After a session is transcribed and compressed, each of its files can be uploaded
+to an R2 bucket. It is off by default. To turn it on, set `upload.r2` in the
+config file:
+
+```yaml
+upload:
+  r2:
+    enabled: true
+    account_id: <your Cloudflare account id>
+    bucket: hatcher-meetrs
+    prefix: meetings/        # optional; keys become meetings/<session>/<file>
+```
+
+The access key stays out of the file. Put it in the environment:
+
+```sh
+export MEETRS_R2_ACCESS_KEY_ID=...
+export MEETRS_R2_SECRET_ACCESS_KEY=...
+# only for temporary credentials:
+export MEETRS_R2_SESSION_TOKEN=...
+```
+
+If `enabled` is true and a credential is missing, meetrs stops before recording
+starts. An upload that fails part way is reported and the session's files stay
+on disk; uploads overwrite the same keys, so re-running is safe.
+
 ## How chunking works
 
 A chunk ends after `SILENCE_TO_CUT` (2s) of continuous audio below the RMS

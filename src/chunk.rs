@@ -1265,8 +1265,8 @@ mod tests {
     fn hard_cap_fires_with_no_silence() {
         let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
-        // Keep feeding loud audio past MAX_CHUNK (300s) with zero silence.
-        let cut = loud_frames(&mut c, 300.0);
+        // Keep feeding loud audio past MAX_CHUNK with zero silence.
+        let cut = loud_frames(&mut c, MAX_CHUNK.as_secs_f64());
         assert_eq!(cut, Some(Cut::HardCap));
     }
 
@@ -1311,6 +1311,8 @@ mod size_cap_tests {
         // Continuous speech, so only the size limit can cut. Three channels of
         // 32-bit float is what the recorder writes.
         let mut c = Chunker::new(48_000, 3);
+        // Lift the time limit so only the size limit can fire here.
+        c.max_chunk = Duration::from_secs(10_000);
         let mut cut = None;
         for _ in 0..100_000 {
             if c.feed(true, 4096) == Some(Cut::HardCap) {

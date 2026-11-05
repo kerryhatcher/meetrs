@@ -16,12 +16,13 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const SILENCE_TO_CUT: Duration = Duration::from_secs(2);
 
 /// Force a cut regardless of silence, so a monologue still bounds crash loss.
-pub const MAX_CHUNK: Duration = Duration::from_secs(300);
+pub const MAX_CHUNK: Duration = Duration::from_secs(150);
 
 /// Largest a chunk may grow, in bytes of WAV. The writer cuts before passing it,
 /// so a chunk's WAV, and the FLAC made from it, stays under 99 MB. The planned
 /// upload backend rejects anything larger. At 3 channels of 32-bit float, a full
-/// MAX_CHUNK would be about 173 MB, so a long unbroken stretch hits this first.
+/// MAX_CHUNK would be about 86 MB at 3 channels, so this is a backstop for
+/// configurations with more channels, not the limit that normally applies.
 pub const MAX_CHUNK_BYTES: u64 = 99_000_000;
 
 /// Below this RMS (linear, not dB) a block counts as silence.

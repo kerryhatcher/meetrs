@@ -45,6 +45,14 @@ pub struct R2Upload {
     /// Key prefix inside the bucket, e.g. `meetings/`. Empty means the bucket root.
     #[serde(default)]
     pub prefix: String,
+    /// Seconds between uploads of whatever changed while recording. A crash
+    /// loses at most this much. Must be at least 30.
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_interval_secs() -> u64 {
+    300
 }
 
 /// What gets written on first run. Everything is commented out, so the file
@@ -62,9 +70,10 @@ const TEMPLATE: &str = "\
 # plain volume threshold. Normal operation ignores it.
 # silence_rms: 0.02
 
-# Upload each session's files to a Cloudflare R2 bucket once it has been
-# transcribed and compressed. Keys look like <prefix><session>/<file>. The
-# access key goes in the environment, never in this file:
+# Upload recordings to a Cloudflare R2 bucket. Every interval_secs, whatever
+# changed is sent, and a final pass runs when recording stops. Keys look like
+# <prefix><session>/<file>. The access key goes in the environment, never in
+# this file:
 #   MEETRS_R2_ACCESS_KEY_ID, MEETRS_R2_SECRET_ACCESS_KEY
 # upload:
 #   r2:
@@ -72,6 +81,7 @@ const TEMPLATE: &str = "\
 #     account_id: <your Cloudflare account id>
 #     bucket: <bucket name>
 #     prefix: ''
+#     interval_secs: 300
 ";
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -159,6 +169,12 @@ fn parse(text: &str, path: &Path) -> Result<Config> {
         );
         crate::r2::check_bucket_name(bucket)
             .with_context(|| format!("{}: upload.r2.bucket", path.display()))?;
+        anyhow::ensure!(
+            r2.interval_secs >= 30,
+            "{}: upload.r2.interval_secs must be at least 30, got {}",
+            path.display(),
+            r2.interval_secs
+        );
     }
     Ok(cfg)
 }
@@ -256,6 +272,14 @@ mod tests {
     fn enabled_upload_rejects_a_bad_bucket_name() {
         let text = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: Bad_Name\n";
         assert!(parse(text, Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn upload_interval_defaults_to_five_minutes_and_has_a_floor() {
+        let on = "upload:\n  r2:\n    enabled: true\n    account_id: abc\n    bucket: hatcher-meetrs\n";
+        assert_eq!(parse(on, Path::new("x")).unwrap().upload.r2.interval_secs, 300);
+        let too_fast = format!("{on}    interval_secs: 5\n");
+        assert!(parse(&too_fast, Path::new("x")).is_err());
     }
 
     #[test]

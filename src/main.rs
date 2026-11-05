@@ -83,7 +83,7 @@ fn main() -> Result<()> {
 
     // Built before anything is recorded, so a missing credential is reported
     // now rather than after a long session has already been captured.
-    let uploader = uploader_from_config()?;
+    let uploader = uploader_from_config()?.map(std::sync::Arc::new);
 
     // Fail before touching the terminal, so errors are readable.
     let started = chrono::Local::now();
@@ -155,6 +155,26 @@ fn main() -> Result<()> {
         .spawn(move || transcribe::run(jobs_rx, model, asr_tx))
         .context("spawning transcribe thread")?;
 
+    // Periodic uploads of whatever has changed, so a crash loses at most one
+    // interval. They run beside recording and never block it.
+    let periodic = match &uploader {
+        Some(u) => {
+            let interval = Duration::from_secs(config::get().upload.r2.interval_secs);
+            let root = types::recordings_dir()?;
+            let since = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(r2::spawn_periodic(
+                std::sync::Arc::clone(u),
+                root,
+                since,
+                interval,
+            )?)
+        }
+        None => None,
+    };
+
     let outcome = ui::run(rx, &dir, info, &stop);
 
     // Always stop capture and the writer and join, even if the UI failed, so
@@ -164,6 +184,19 @@ fn main() -> Result<()> {
     let write_result = writer
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+
+    // Stop periodic uploads before anything is printed, so their errors can't
+    // land on the TUI. The final pass below reuses what they already sent.
+    let (periodic_errors, mut sent) = match periodic {
+        Some(p) => {
+            let r = p.finish();
+            (r.errors, r.sent)
+        }
+        None => (Vec::new(), r2::Sent::new()),
+    };
+    for e in &periodic_errors {
+        eprintln!("meetrs: upload during recording: {e}");
+    }
 
     // Restore the terminal before reporting anything.
     outcome?;
@@ -205,7 +238,7 @@ fn main() -> Result<()> {
     // Upload whatever is on disk, whether or not transcription finished: the
     // audio is the part worth keeping off this machine.
     if let Some(uploader) = &uploader {
-        upload_sessions(uploader, &summary.sessions);
+        upload_sessions(uploader, &summary.sessions, &mut sent);
     }
 
     for session in &summary.sessions {
@@ -288,18 +321,21 @@ fn uploader_from_config() -> Result<Option<r2::Uploader>> {
     Ok(Some(r2::Uploader::new(target, creds)))
 }
 
-/// Upload each session directory. A failure is reported and the next session is
-/// tried: the audio is still on disk, so nothing here can lose it.
-fn upload_sessions(uploader: &r2::Uploader, sessions: &[std::path::PathBuf]) {
-    for dir in sessions {
-        match uploader.upload_session(dir) {
-            Ok(n) => println!(
-                "uploaded {n} file(s) from {} to bucket {}",
-                dir.display(),
-                uploader.target.bucket
-            ),
-            Err(e) => eprintln!("meetrs: upload failed for {}: {e:#}", dir.display()),
-        }
+/// Final upload after the recording and compression are done. Anything the
+/// periodic passes already sent and that has not changed is skipped. What is
+/// left is what changed afterwards: the compressed FLACs, and the transcript
+/// after its last chunk. A failure is reported. The audio stays on disk.
+fn upload_sessions(uploader: &r2::Uploader, sessions: &[std::path::PathBuf], sent: &mut r2::Sent) {
+    let errors = uploader.upload_pass(sessions, None, sent);
+    for e in &errors {
+        eprintln!("meetrs: upload failed: {e}");
+    }
+    if errors.is_empty() && !sessions.is_empty() {
+        println!(
+            "uploaded {} session(s) to bucket {}",
+            sessions.len(),
+            uploader.target.bucket
+        );
     }
 }
 

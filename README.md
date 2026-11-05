@@ -167,8 +167,10 @@ key or a malformed value stops startup and names the file and the problem.
 
 ### Uploading to Cloudflare R2
 
-After a session is transcribed and compressed, each of its files can be uploaded
-to an R2 bucket. It is off by default. To turn it on, set `upload.r2` in the
+Session files can be uploaded to an R2 bucket. Every `interval_secs` (default
+300) whatever changed is sent, so a crash loses at most that much. A final pass
+runs when recording stops, after transcription and compression. Uploads run on
+their own thread and never delay recording. It is off by default. To turn it on, set `upload.r2` in the
 config file:
 
 ```yaml
@@ -178,6 +180,7 @@ upload:
     account_id: <your Cloudflare account id>
     bucket: hatcher-meetrs
     prefix: meetings/        # optional; keys become meetings/<session>/<file>
+    interval_secs: 300       # optional; how often changed files are sent (min 30)
 ```
 
 The access key stays out of the file. Put it in the environment:
@@ -190,8 +193,11 @@ export MEETRS_R2_SESSION_TOKEN=...
 ```
 
 If `enabled` is true and a credential is missing, meetrs stops before recording
-starts. An upload that fails part way is reported and the session's files stay
-on disk; uploads overwrite the same keys, so re-running is safe.
+starts. A failed upload is reported and retried on the next pass. The files stay
+on disk, and uploads overwrite the same keys, so retrying is safe.
+
+Compressed sessions leave their original WAV objects in the bucket next to the
+FLAC files, because the final pass does not delete anything.
 
 ## How chunking works
 

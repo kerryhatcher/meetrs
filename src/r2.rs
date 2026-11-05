@@ -11,10 +11,13 @@
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 /// Signing region. R2 ignores the value but SigV4 requires one, and `auto` is
 /// what Cloudflare's documentation uses.
@@ -109,6 +112,18 @@ pub struct Uploader {
     agent: ureq::Agent,
 }
 
+/// What a file looked like when it was last sent. A file whose stamp has not
+/// changed since is not sent again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    len: u64,
+    modified: SystemTime,
+}
+
+/// The files already sent, keyed by path. Passed between passes so a periodic
+/// pass and the final pass do not resend what is unchanged.
+pub type Sent = HashMap<PathBuf, Stamp>;
+
 impl Uploader {
     pub fn new(target: Target, creds: Credentials) -> Self {
         let agent = ureq::Agent::config_builder()
@@ -122,37 +137,64 @@ impl Uploader {
         }
     }
 
-    /// Upload every file in `session_dir` under `<prefix><session name>/`.
-    /// Returns how many files went up. Stops at the first failure: the files
-    /// already sent stay in the bucket, and a later run overwrites them safely,
-    /// so there is nothing to clean up.
-    pub fn upload_session(&self, session_dir: &Path) -> Result<usize> {
+    /// Send every file in `sessions` that is new or has changed since `sent`
+    /// last saw it. `active` is the session still being recorded: its newest
+    /// WAV is skipped because that chunk is still being written. Returns the
+    /// errors. A failed file is left out of `sent`, so the next pass retries it.
+    pub fn upload_pass(
+        &self,
+        sessions: &[PathBuf],
+        active: Option<&Path>,
+        sent: &mut Sent,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for dir in sessions {
+            let skip = if active == Some(dir.as_path()) {
+                newest_wav(dir)
+            } else {
+                None
+            };
+            let changed = match changed_files(dir, sent, skip.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors.push(format!("{}: {e:#}", dir.display()));
+                    continue;
+                }
+            };
+            for (file, stamp) in changed {
+                match self.put_file(dir, &file) {
+                    Ok(()) => {
+                        sent.insert(file, stamp);
+                    }
+                    Err(e) => errors.push(format!("{}: {e:#}", file.display())),
+                }
+            }
+        }
+        errors
+    }
+
+    /// `<prefix><session>/<file>`.
+    fn key_for(&self, session_dir: &Path, file: &Path) -> Result<String> {
         let session = session_dir
             .file_name()
             .and_then(|n| n.to_str())
-            .with_context(|| format!("session dir has no name: {}", session_dir.display()))?
-            .to_string();
-
-        let files = session_files(session_dir)?;
-        for file in &files {
-            let name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .context("non-UTF-8 file name")?;
-            let key = format!("{}{session}/{name}", self.target.prefix);
-            self.put_file(file, &key)
-                .with_context(|| format!("uploading {name}"))?;
-        }
-        Ok(files.len())
+            .with_context(|| format!("session dir has no name: {}", session_dir.display()))?;
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("non-UTF-8 file name")?;
+        Ok(format!("{}{session}/{name}", self.target.prefix))
     }
 
-    fn put_file(&self, path: &Path, key: &str) -> Result<()> {
+    fn put_file(&self, session_dir: &Path, path: &Path) -> Result<()> {
+        let key = self.key_for(session_dir, path)?;
+        let encoded = encode_path(&key);
         let payload_sha256 = sha256_file_hex(path)?;
         let now = chrono::Utc::now();
         let headers = sign_put(
             &self.creds,
             &self.target.host(),
-            &self.target.object_path(&encode_path(key)),
+            &self.target.object_path(&encoded),
             &payload_sha256,
             &now.format("%Y%m%dT%H%M%SZ").to_string(),
             &now.format("%Y%m%d").to_string(),
@@ -161,7 +203,7 @@ impl Uploader {
         let url = format!(
             "https://{}{}",
             self.target.host(),
-            self.target.object_path(&encode_path(key))
+            self.target.object_path(&encoded)
         );
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut request = self.agent.put(&url);
@@ -190,6 +232,126 @@ fn session_files(dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     files.sort();
     Ok(files)
+}
+
+/// Files in `dir` that are new or differ from `sent`. `skip` is left out
+/// entirely. A file that vanishes between listing and stat is ignored, since
+/// compression can remove WAVs while a pass is running.
+pub fn changed_files(
+    dir: &Path,
+    sent: &Sent,
+    skip: Option<&Path>,
+) -> Result<Vec<(PathBuf, Stamp)>> {
+    let mut changed = Vec::new();
+    for file in session_files(dir)? {
+        if skip == Some(file.as_path()) {
+            continue;
+        }
+        let Ok(now) = stamp(&file) else { continue };
+        if sent.get(&file) != Some(&now) {
+            changed.push((file, now));
+        }
+    }
+    Ok(changed)
+}
+
+fn stamp(path: &Path) -> Result<Stamp> {
+    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(Stamp {
+        len: meta.len(),
+        modified: meta.modified().context("no modification time")?,
+    })
+}
+
+/// The highest-indexed WAV in `dir`: the chunk most likely still being written.
+pub fn newest_wav(dir: &Path) -> Option<PathBuf> {
+    session_files(dir)
+        .ok()?
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .last()
+}
+
+/// Session directories under `root` whose names sort at or after `since`,
+/// oldest first. Names are `%Y-%m-%dT%H-%M-%S`, so string order is time order.
+pub fn sessions_since(root: &Path, since: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.as_bytes().first().is_some_and(u8::is_ascii_digit) && n >= since
+                })
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// What a periodic thread hands back when it stops: the errors it hit, and the
+/// files it has already sent, so the final pass can skip them.
+pub struct PeriodicResult {
+    pub errors: Vec<String>,
+    pub sent: Sent,
+}
+
+/// A running periodic-upload thread.
+pub struct Periodic {
+    stop: mpsc::Sender<()>,
+    handle: JoinHandle<PeriodicResult>,
+}
+
+impl Periodic {
+    /// Stop the thread after its current pass, if any, and collect its result.
+    /// Any pass in flight is finished first, so this can block for as long as
+    /// one upload takes.
+    pub fn finish(self) -> PeriodicResult {
+        let Periodic { stop, handle } = self;
+        drop(stop);
+        handle.join().unwrap_or_else(|_| PeriodicResult {
+            errors: vec!["periodic upload thread panicked".into()],
+            sent: Sent::new(),
+        })
+    }
+}
+
+/// Start a thread that uploads whatever changed every `interval`, for as long as
+/// recording runs. It never prints: the TUI owns the terminal, so its errors
+/// come back through `Periodic::finish`.
+///
+/// `since` is the name of the first session in this run. Sessions in `root`
+/// with names at or after it belong to this run.
+pub fn spawn_periodic(
+    uploader: Arc<Uploader>,
+    root: PathBuf,
+    since: String,
+    interval: Duration,
+) -> Result<Periodic> {
+    let (stop, stop_rx) = mpsc::channel::<()>();
+    let handle = std::thread::Builder::new()
+        .name("meetrs-upload".into())
+        .spawn(move || {
+            let mut sent = Sent::new();
+            let mut errors = Vec::new();
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // The sender was dropped by `finish`, or a message arrived.
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                let sessions = sessions_since(&root, &since);
+                // The newest session is the one being recorded. Earlier ones
+                // have closed, so every file in them is final.
+                let active = sessions.last().cloned();
+                errors.extend(uploader.upload_pass(&sessions, active.as_deref(), &mut sent));
+            }
+            PeriodicResult { errors, sent }
+        })
+        .context("spawning upload thread")?;
+    Ok(Periodic { stop, handle })
 }
 
 /// Percent-encode an object key for the URI, keeping `/` as the separator.
@@ -450,5 +612,74 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["chunk-000.flac", "chunk-001.flac", "meta.json"]);
+    }
+}
+
+#[cfg(test)]
+mod periodic_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("meetrs-r2-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_file_is_sent_once_then_only_when_it_changes() {
+        let dir = scratch("changed");
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        let mut sent = Sent::new();
+
+        let first = changed_files(&dir, &sent, None).unwrap();
+        assert_eq!(first.len(), 1);
+        sent.insert(first[0].0.clone(), first[0].1);
+
+        assert!(changed_files(&dir, &sent, None).unwrap().is_empty());
+
+        // Different length, so the stamp differs even on a coarse clock.
+        std::fs::write(dir.join("meta.json"), b"{\"a\":1}").unwrap();
+        assert_eq!(changed_files(&dir, &sent, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_skipped_file_is_left_out_even_when_new() {
+        let dir = scratch("skip");
+        std::fs::write(dir.join("chunk-000.wav"), b"a").unwrap();
+        std::fs::write(dir.join("chunk-001.wav"), b"b").unwrap();
+        let active = newest_wav(&dir).unwrap();
+        assert!(active.ends_with("chunk-001.wav"));
+
+        let names: Vec<String> = changed_files(&dir, &Sent::new(), Some(&active))
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["chunk-000.wav"]);
+    }
+
+    #[test]
+    fn only_sessions_at_or_after_the_run_start_are_picked_up() {
+        let root = scratch("since");
+        for name in [
+            "2026-11-04T09-00-00",
+            "2026-11-05T08-00-00",
+            "2026-11-05T09-30-00",
+            "scratch",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let names: Vec<String> = sessions_since(&root, "2026-11-05T08-00-00")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["2026-11-05T08-00-00", "2026-11-05T09-30-00"]);
+    }
+
+    #[test]
+    fn a_missing_root_has_no_sessions() {
+        let root = std::env::temp_dir().join("meetrs-r2-no-such-root-xyz");
+        assert!(sessions_since(&root, "2026").is_empty());
     }
 }

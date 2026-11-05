@@ -17,8 +17,14 @@ installed_exe := installed + "/Contents/MacOS/meetrs"
 default:
     @just --list
 
-# build the release binary
+# build the release binary; skipped when no source or Cargo file is newer than it
 build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -x "{{bin}}" ] && [ -z "$(find src Cargo.toml Cargo.lock -newer "{{bin}}" -print -quit)" ]; then
+        echo "up to date: {{bin}}"
+        exit 0
+    fi
     cargo build --release
 
 # rebuild the .app only when missing or the binary is newer than what's bundled
@@ -40,8 +46,22 @@ bundle: build
 # launching it is the configuration that was actually granted. meetrs preflights
 # capture itself before taking the screen, and refuses to start a session that
 # would provably record nothing.
+#
+# R2 credentials come from a SOPS-encrypted env file (MEETRS_SECRETS, default
+# ~/secrets/meetrs.env), injected only into the app's process. If sops, the file,
+# or its decryption is unavailable, the app still starts, with uploads off.
 run: install
-    exec "{{installed_exe}}"
+    #!/usr/bin/env bash
+    secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
+    app="{{installed_exe}}"
+    start_without_uploads() {
+        echo "meetrs: WARNING: $1; starting without R2 credentials, so uploads are off" >&2
+        exec "$app"
+    }
+    command -v sops >/dev/null 2>&1 || start_without_uploads "sops is not installed"
+    [ -f "$secrets" ] || start_without_uploads "$secrets not found"
+    sops decrypt "$secrets" >/dev/null 2>&1 || start_without_uploads "could not decrypt $secrets"
+    exec sops exec-env "$secrets" "\"$app\""
 
 # build, bundle if needed, and run headless calibration (sets MEETRS_SILENCE_RMS)
 check: bundle

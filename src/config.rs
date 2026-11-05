@@ -21,6 +21,12 @@ pub struct Config {
     /// chunking is driven by the VAD and ignores this. See
     /// `types::DEFAULT_SILENCE_RMS`.
     pub silence_rms: Option<f32>,
+    /// Seconds of continuous speech before a chunk is closed. Default 150.
+    /// See `types::max_chunk`.
+    pub max_chunk_secs: Option<f64>,
+    /// The largest a chunk's WAV may grow, in bytes, and the largest file the
+    /// uploader sends. Default 99,000,000. See `types::max_chunk_bytes`.
+    pub max_chunk_bytes: Option<u64>,
     #[serde(default)]
     pub upload: Upload,
 }
@@ -55,6 +61,28 @@ fn default_interval_secs() -> u64 {
     300
 }
 
+/// Smallest `max_chunk_secs` allowed. Shorter chunks would cut speech mid-word.
+const MIN_MAX_CHUNK_SECS: f64 = 10.0;
+/// Smallest `max_chunk_bytes` allowed. It has to hold more than the one second
+/// of frames the chunker keeps back, so the limit is never reached by silence alone.
+const MIN_MAX_CHUNK_BYTES: u64 = 10_000_000;
+
+/// The chunk-length key, as written to a new file or added to an existing one.
+const MAX_CHUNK_SECS_BLOCK: &str = "\
+# How long a recording chunk may run, in seconds of continuous speech, before it
+# is closed. A chunk also closes after 2 seconds of silence, so this only limits
+# unbroken speech. Minimum 10.
+max_chunk_secs: 150
+";
+
+/// The chunk-size key, as written to a new file or added to an existing one.
+const MAX_CHUNK_BYTES_BLOCK: &str = "\
+# The largest a chunk's WAV may grow, in bytes. A chunk is closed before it would
+# pass this. Uploads also refuse any file over it. 99 MB keeps files under the
+# planned backend's limit. Minimum 10000000.
+max_chunk_bytes: 99000000
+";
+
 /// What gets written on first run. Everything is commented out, so the file
 /// parses to `Config::default()` and the compiled-in values stay in effect until
 /// the user opts in to a key.
@@ -63,7 +91,18 @@ const TEMPLATE: &str = "\
 #
 # Created on first run. Edit freely; meetrs reads it at startup and never
 # rewrites it. Environment variables such as MEETRS_SILENCE_RMS override these
-# values. Keys are commented out so the built-in defaults apply.
+# values. A commented-out key falls back to its built-in default. The chunk limits
+# below are written in full, so their defaults are visible.
+
+# How long a recording chunk may run, in seconds of continuous speech, before it
+# is closed. A chunk also closes after 2 seconds of silence, so this only limits
+# unbroken speech. Minimum 10.
+max_chunk_secs: 150
+
+# The largest a chunk's WAV may grow, in bytes. A chunk is closed before it would
+# pass this. Uploads also refuse any file over it. 99 MB keeps files under the
+# planned backend's limit. Minimum 10000000.
+max_chunk_bytes: 99000000
 
 # Below this RMS (linear, not dB) a block counts as silence. This only applies
 # when the voice-activity detector fails to load and meetrs falls back to a
@@ -112,12 +151,59 @@ pub fn get() -> &'static Config {
 /// Read `path`, writing the template there first if it does not exist.
 fn load_or_create(path: &Path) -> Result<Config> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse(&text, path),
+        Ok(text) => {
+            let cfg = parse(&text, path)?;
+            add_missing_keys(path, &text, cfg)
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => {
             create_template(path)?;
             Ok(Config::default())
         }
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Add the chunk-limit keys the file does not define, at their defaults, so the
+/// user can see the options and what they are set to. Only these keys are ever
+/// appended, and only at the end of the file. The new text is parsed before
+/// anything is written, so a file that would not load is left untouched.
+fn add_missing_keys(path: &Path, text: &str, cfg: Config) -> Result<Config> {
+    let mut add = String::new();
+    if cfg.max_chunk_secs.is_none() {
+        add.push_str(MAX_CHUNK_SECS_BLOCK);
+    }
+    if cfg.max_chunk_bytes.is_none() {
+        if !add.is_empty() {
+            add.push('\n');
+        }
+        add.push_str(MAX_CHUNK_BYTES_BLOCK);
+    }
+    if add.is_empty() {
+        return Ok(cfg);
+    }
+
+    let gap = if text.is_empty() || text.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let combined = format!("{text}{gap}\n{add}");
+    let updated = parse(&combined, path)?;
+
+    let written = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(format!("{gap}\n{add}").as_bytes()));
+    match written {
+        Ok(()) => Ok(updated),
+        // Read-only or in use: meetrs still runs, with the same values in effect.
+        Err(e) => {
+            eprintln!(
+                "meetrs: warning: could not add chunk settings to {}: {e}",
+                path.display()
+            );
+            Ok(updated)
+        }
     }
 }
 
@@ -144,6 +230,20 @@ fn parse(text: &str, path: &Path) -> Result<Config> {
     let cfg = serde_yaml_ng::from_str::<Option<Config>>(text)
         .with_context(|| format!("parsing {}", path.display()))?
         .unwrap_or_default();
+    if let Some(secs) = cfg.max_chunk_secs {
+        anyhow::ensure!(
+            secs.is_finite() && secs >= MIN_MAX_CHUNK_SECS,
+            "{}: max_chunk_secs must be at least {MIN_MAX_CHUNK_SECS}, got {secs}",
+            path.display()
+        );
+    }
+    if let Some(bytes) = cfg.max_chunk_bytes {
+        anyhow::ensure!(
+            bytes >= MIN_MAX_CHUNK_BYTES,
+            "{}: max_chunk_bytes must be at least {MIN_MAX_CHUNK_BYTES}, got {bytes}",
+            path.display()
+        );
+    }
     if let Some(rms) = cfg.silence_rms {
         anyhow::ensure!(
             rms > 0.0 && rms.is_finite(),
@@ -199,14 +299,61 @@ mod tests {
     }
 
     #[test]
-    fn existing_file_is_never_overwritten() {
+    fn existing_file_keeps_its_own_text_and_gains_only_the_chunk_keys() {
         let path = scratch("keep");
         std::fs::write(&path, "silence_rms: 0.05\n").unwrap();
         let cfg = load_or_create(&path).expect("load");
         assert_eq!(cfg.silence_rms, Some(0.05));
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "silence_rms: 0.05\n"
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("silence_rms: 0.05\n"), "{text}");
+        assert!(text.contains(MAX_CHUNK_SECS_BLOCK));
+        assert!(text.contains(MAX_CHUNK_BYTES_BLOCK));
+    }
+
+    #[test]
+    fn missing_chunk_keys_are_added_with_their_defaults() {
+        let path = scratch("add");
+        std::fs::write(&path, "silence_rms: 0.03").unwrap(); // no trailing newline
+        let cfg = load_or_create(&path).expect("load");
+        assert_eq!(cfg.max_chunk_secs, Some(150.0));
+        assert_eq!(cfg.max_chunk_bytes, Some(99_000_000));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("max_chunk_secs: 150"), "{text}");
+        assert!(text.contains("max_chunk_bytes: 99000000"), "{text}");
+        // Second load: nothing left to add, so the file does not change.
+        let before = text.clone();
+        load_or_create(&path).expect("reload");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_defined_chunk_key_is_left_alone() {
+        let path = scratch("defined");
+        let text = "max_chunk_secs: 60\nmax_chunk_bytes: 50000000\n";
+        std::fs::write(&path, text).unwrap();
+        let cfg = load_or_create(&path).expect("load");
+        assert_eq!(cfg.max_chunk_secs, Some(60.0));
+        assert_eq!(cfg.max_chunk_bytes, Some(50_000_000));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn template_carries_both_chunk_blocks_verbatim() {
+        assert!(TEMPLATE.contains(MAX_CHUNK_SECS_BLOCK));
+        assert!(TEMPLATE.contains(MAX_CHUNK_BYTES_BLOCK));
+    }
+
+    #[test]
+    fn chunk_limits_below_the_minimum_are_rejected() {
+        assert!(parse("max_chunk_secs: 5\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_secs: .inf\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_bytes: 1000\n", Path::new("x")).is_err());
+        assert!(
+            parse(
+                "max_chunk_secs: 10\nmax_chunk_bytes: 10000000\n",
+                Path::new("x")
+            )
+            .is_ok()
         );
     }
 

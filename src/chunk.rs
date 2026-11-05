@@ -7,7 +7,7 @@
 //!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, jobs: mpsc::Sender<Job>, stop: StopFlag) -> Result<Summary>
 
 use crate::types::{
-    CaptureInfo, IDLE_ROLLOVER, Job, MAX_CHUNK, MAX_CHUNK_BYTES, MIN_CHUNK, SILENCE_TO_CUT, Status,
+    CaptureInfo, IDLE_ROLLOVER, Job, MIN_CHUNK, SILENCE_TO_CUT, Status, max_chunk, max_chunk_bytes,
     next_midnight,
     session_dir,
 };
@@ -50,7 +50,7 @@ pub struct Summary {
 enum Cut {
     /// Silence exceeded SILENCE_TO_CUT: close the current chunk (if any speech was captured).
     Silence,
-    /// MAX_CHUNK or MAX_CHUNK_BYTES reached: force a cut regardless of silence state.
+    /// The time or size limit was reached: force a cut regardless of silence state.
     HardCap,
 }
 
@@ -60,7 +60,7 @@ enum Cut {
 struct Chunker {
     silence_to_cut: Duration,
     max_chunk: Duration,
-    /// Frames an open chunk may hold before it is cut for size. See MAX_CHUNK_BYTES.
+    /// Frames an open chunk may hold before it is cut for size. See `max_chunk_bytes`.
     max_frames: u64,
     /// Frames of continuous silence seen since the last non-silent frame.
     silence_frames: u64,
@@ -81,13 +81,13 @@ impl Chunker {
     fn new(sample_rate: u32, channels: u16) -> Self {
         // 32-bit float, so four bytes per channel per frame. One second of
         // frames is held back for the pre-roll and for the batch that crosses
-        // the limit, so the file stays under MAX_CHUNK_BYTES.
+        // the limit, so the file stays under `max_chunk_bytes`.
         let bytes_per_frame = channels.max(1) as u64 * 4;
         let max_frames =
-            (MAX_CHUNK_BYTES / bytes_per_frame).saturating_sub(sample_rate as u64);
+            (max_chunk_bytes() / bytes_per_frame).saturating_sub(sample_rate as u64);
         Chunker {
             silence_to_cut: SILENCE_TO_CUT,
-            max_chunk: MAX_CHUNK,
+            max_chunk: max_chunk(),
             max_frames,
             silence_frames: 0,
             chunk_frames: 0,
@@ -1265,8 +1265,8 @@ mod tests {
     fn hard_cap_fires_with_no_silence() {
         let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
-        // Keep feeding loud audio past MAX_CHUNK with zero silence.
-        let cut = loud_frames(&mut c, MAX_CHUNK.as_secs_f64());
+        // Keep feeding loud audio past the time limit with zero silence.
+        let cut = loud_frames(&mut c, max_chunk().as_secs_f64());
         assert_eq!(cut, Some(Cut::HardCap));
     }
 
@@ -1322,8 +1322,8 @@ mod size_cap_tests {
         }
         let frames = cut.expect("a long unbroken chunk must be cut");
         let bytes = frames * 3 * 4;
-        assert!(bytes <= MAX_CHUNK_BYTES, "{bytes} bytes is over the limit");
+        assert!(bytes <= max_chunk_bytes(), "{bytes} bytes is over the limit");
         // Not early either: the cut lands within a second of the budget.
-        assert!(bytes + 48_000 * 12 > MAX_CHUNK_BYTES, "cut too early at {bytes} bytes");
+        assert!(bytes + 48_000 * 12 > max_chunk_bytes(), "cut too early at {bytes} bytes");
     }
 }

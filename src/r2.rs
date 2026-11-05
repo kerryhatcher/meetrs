@@ -9,7 +9,7 @@
 //! secret is not sitting in plaintext in the file a user might paste into a bug
 //! report.
 
-use crate::types::MAX_CHUNK_BYTES;
+use crate::types::max_chunk_bytes;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -173,14 +173,14 @@ impl Uploader {
                 }
             };
             for (file, stamp) in changed {
-                if stamp.len > MAX_CHUNK_BYTES {
+                if stamp.len > max_chunk_bytes() {
                     // The planned backend rejects this size. Mark it as seen, so later
                     // passes do not report it again, and leave it on disk.
                     errors.push(format!(
                         "{}: {} MB is over the {} MB limit, not uploaded",
                         file.display(),
                         stamp.len / 1_000_000,
-                        MAX_CHUNK_BYTES / 1_000_000
+                        max_chunk_bytes() / 1_000_000
                     ));
                     sent.insert(file, stamp);
                     continue;
@@ -737,7 +737,7 @@ mod size_limit_tests {
         let big = dir.join("session-full.flac");
         std::fs::File::create(&big)
             .unwrap()
-            .set_len(MAX_CHUNK_BYTES + 1)
+            .set_len(max_chunk_bytes() + 1)
             .unwrap();
 
         let uploader = Uploader::new(

@@ -164,6 +164,11 @@ key or a malformed value stops startup and names the file and the problem.
 | Key | Default | Effect |
 |---|---|---|
 | `silence_rms` | `0.02` | RMS threshold for the fallback path only (see above). Overridden by `MEETRS_SILENCE_RMS`. |
+| `max_chunk_secs` | `150` | Seconds of continuous speech before a chunk is closed. Minimum 10. |
+| `max_chunk_bytes` | `99000000` | Largest a chunk's WAV may grow, and the largest file the uploader sends. Minimum 10000000. |
+
+The two chunk limits are written to the file on startup with their defaults, if
+the file does not already set them, so they show up as options.
 
 ### Uploading to Cloudflare R2
 
@@ -206,8 +211,8 @@ FLAC files, because the final pass does not delete anything.
 ## How chunking works
 
 A chunk ends after `SILENCE_TO_CUT` (2s) of continuous audio below the RMS
-threshold, or at `MAX_CHUNK` (2.5min) regardless, or before its WAV would pass
-`MAX_CHUNK_BYTES` (99 MB). The size cut keeps every chunk, and the FLAC made from
+threshold, or after `max_chunk_secs` (2.5 min) of continuous speech, or before its
+WAV would pass `max_chunk_bytes` (99 MB). The size cut keeps every chunk, and the FLAC made from
 it, under the 99 MB limit of the planned upload backend — a monologue still bounds crash
 loss. Chunks under `MIN_CHUNK` (750ms) are discarded rather than written, so a
 stray cough between two pauses doesn't leave a file behind.

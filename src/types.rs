@@ -15,15 +15,32 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// A natural conversational pause, not an inter-word gap.
 pub const SILENCE_TO_CUT: Duration = Duration::from_secs(2);
 
-/// Force a cut regardless of silence, so a monologue still bounds crash loss.
-pub const MAX_CHUNK: Duration = Duration::from_secs(150);
+/// Default for `max_chunk_secs` in config.yaml. Force a cut after this much
+/// continuous speech, so a monologue still bounds crash loss.
+pub const DEFAULT_MAX_CHUNK: Duration = Duration::from_secs(150);
 
-/// Largest a chunk may grow, in bytes of WAV. The writer cuts before passing it,
-/// so a chunk's WAV, and the FLAC made from it, stays under 99 MB. The planned
-/// upload backend rejects anything larger. At 3 channels of 32-bit float, a full
-/// MAX_CHUNK would be about 86 MB at 3 channels, so this is a backstop for
-/// configurations with more channels, not the limit that normally applies.
-pub const MAX_CHUNK_BYTES: u64 = 99_000_000;
+/// Default for `max_chunk_bytes` in config.yaml. The largest a chunk's WAV may
+/// grow. The writer cuts before passing it, so the chunk and the FLAC made from
+/// it stay under 99 MB, and the uploader will not send a larger file. The planned
+/// upload backend rejects anything bigger.
+pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 99_000_000;
+
+/// Force a cut after this much continuous speech. Config `max_chunk_secs`, else
+/// `DEFAULT_MAX_CHUNK`.
+pub fn max_chunk() -> Duration {
+    crate::config::get()
+        .max_chunk_secs
+        .map(Duration::from_secs_f64)
+        .unwrap_or(DEFAULT_MAX_CHUNK)
+}
+
+/// The size limit for a chunk's WAV, and for any file the uploader sends. Config
+/// `max_chunk_bytes`, else `DEFAULT_MAX_CHUNK_BYTES`.
+pub fn max_chunk_bytes() -> u64 {
+    crate::config::get()
+        .max_chunk_bytes
+        .unwrap_or(DEFAULT_MAX_CHUNK_BYTES)
+}
 
 /// Below this RMS (linear, not dB) a block counts as silence.
 ///

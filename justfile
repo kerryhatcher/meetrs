@@ -39,8 +39,6 @@ bundle: build
     # this a no-op once it matches.
     ./scripts/sign.sh --if-needed "{{app}}"
 
-# build, install, and launch the TUI recorder
-#
 # Deliberately runs the *installed* bundle rather than target/: that is the copy
 # System Settings lists and attaches consent to, and it lives at a stable path, so
 # launching it is the configuration that was actually granted. meetrs preflights
@@ -50,6 +48,8 @@ bundle: build
 # R2 credentials come from a SOPS-encrypted env file (MEETRS_SECRETS, default
 # ~/secrets/meetrs.env), injected only into the app's process. If sops, the file,
 # or its decryption is unavailable, the app still starts, with uploads off.
+#
+# build, install, and launch the TUI recorder
 run: install
     #!/usr/bin/env bash
     secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
@@ -78,12 +78,18 @@ reindex: bundle
 # Deletes a chunk's WAV only after its FLAC verifies; untranscribed chunks are
 # left alone. New sessions compress themselves at session end.
 #
+# Arguments reach the script as "$@" and are quoted with printf %q, so a path
+# with spaces or shell characters is passed through as one argument.
+#
 # upload sessions to R2 now, with the credentials from SOPS: just upload [session-dir...]
+[positional-arguments]
 upload *DIRS: bundle
     #!/usr/bin/env bash
+    set -euo pipefail
     secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
     [ -f "$secrets" ] || { echo "no credentials file at $secrets" >&2; exit 1; }
-    exec sops exec-env "$secrets" "\"{{exe}}\" --upload {{DIRS}}"
+    cmd=$(printf '%q ' "{{exe}}" --upload "$@")
+    exec sops exec-env "$secrets" "$cmd"
 
 # compress older sessions to FLAC: just compress [session-dir...]
 compress *DIRS: bundle

@@ -79,10 +79,11 @@ fn main() -> Result<()> {
             println!("meetrs {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        // Without this, a mistyped flag would fall through to the recorder and
-        // start a session the user did not ask for.
-        Some(flag) if flag.starts_with('-') && !KNOWN_FLAGS.contains(&flag) => {
-            anyhow::bail!("unknown option {flag}; run `meetrs --help` for the list");
+        // Without this, a mistyped flag, or a word such as `upload` with no dash,
+        // would fall through to the recorder and start a session the user did not
+        // ask for. Only the known flags may start anything.
+        Some(arg) if !KNOWN_FLAGS.contains(&arg) => {
+            anyhow::bail!("unknown option or command {arg}; run `meetrs --help` for the list");
         }
         _ => {}
     }
@@ -426,7 +427,7 @@ fn upload_old(dirs: &[String]) -> Result<()> {
     let mut failures = 0usize;
     for (i, dir) in sessions.iter().enumerate() {
         let before = sent.len();
-        let errors = uploader.upload_pass(std::slice::from_ref(dir), None, &mut sent);
+        let errors = uploader.upload_pass(std::slice::from_ref(dir), None, &mut sent, None);
         let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
         println!(
             "[{}/{}] {}: {} file(s){}",
@@ -458,7 +459,7 @@ fn upload_old(dirs: &[String]) -> Result<()> {
 /// left is what changed afterwards: the compressed FLACs, and the transcript
 /// after its last chunk. A failure is reported. The audio stays on disk.
 fn upload_sessions(uploader: &r2::Uploader, sessions: &[std::path::PathBuf], sent: &mut r2::Sent) {
-    let errors = uploader.upload_pass(sessions, None, sent);
+    let errors = uploader.upload_pass(sessions, None, sent, None);
     for e in &errors {
         eprintln!("meetrs: upload failed: {e}");
     }

@@ -23,6 +23,42 @@ use anyhow::{Context, Result};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Flags the first argument may be. Anything else starting with `-` is an error.
+const KNOWN_FLAGS: &[&str] = &[
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+    "--search",
+    "--reindex",
+    "--upload",
+    "--compress",
+    "--check",
+];
+
+const HELP: &str = "\
+meetrs: terminal meeting recorder. Captures microphone and system audio in
+chunks, and transcribes each chunk locally.
+
+usage:
+  meetrs                        record until you quit (Ctrl-C or q)
+  meetrs --search <query>       full-text search across every transcript
+  meetrs --reindex              rebuild the search index from the files on disk
+  meetrs --upload [dir...]      send sessions to R2 now (default: every session)
+  meetrs --compress [dir...]    compress older sessions to FLAC
+  meetrs --check                measure input levels to choose a silence threshold
+  meetrs -h, --help             show this help
+  meetrs -V, --version          show the version
+
+files:
+  ~/.meetrs/config.yaml         settings, created on first run
+  ~/.meetrs/recordings/         one directory per session
+  ~/.meetrs/meetrs.db           search index (derived, rebuildable)
+
+R2 uploads read their credentials from MEETRS_R2_ACCESS_KEY_ID and
+MEETRS_R2_SECRET_ACCESS_KEY. `just run` and `just upload` load them from SOPS.
+";
+
 /// Ring buffer capacity in samples. At 48kHz × 4ch that is ~4 seconds of slack
 /// between the realtime callback and the writer thread — generous, because the
 /// cost of overrun is corrupt audio and the cost of the memory is 3MB.
@@ -30,14 +66,34 @@ const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
 fn main() -> Result<()> {
-    // First, so ~/.meetrs/config.yaml exists from the first run on, and so a
-    // malformed file is reported before any setting is read. Every subcommand
-    // goes through here, including --search, which is cheap and harmless.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Answered before anything else: no config file is created, no lock is taken,
+    // no audio device is touched, so these work while a recording is running.
+    match args.first().map(String::as_str) {
+        Some("-h" | "--help") => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("meetrs {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Without this, a mistyped flag would fall through to the recorder and
+        // start a session the user did not ask for.
+        Some(flag) if flag.starts_with('-') && !KNOWN_FLAGS.contains(&flag) => {
+            anyhow::bail!("unknown option {flag}; run `meetrs --help` for the list");
+        }
+        _ => {}
+    }
+
+    // So ~/.meetrs/config.yaml exists from the first run on, and so a malformed
+    // file is reported before any setting is read. Subcommands below go through
+    // here too, including --search, which is cheap and harmless.
     config::init()?;
 
     // Read-only queries don't touch the audio device, so they run without the
     // single-instance lock — you can search while a recording is in progress.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--search") => return search(&args[1..].join(" ")),
         Some("--reindex") => return reindex(),

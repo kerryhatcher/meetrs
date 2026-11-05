@@ -8,6 +8,7 @@
 mod capture;
 mod chunk;
 mod compress;
+mod config;
 mod db;
 mod lock;
 mod model;
@@ -28,6 +29,11 @@ const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
 fn main() -> Result<()> {
+    // First, so ~/.meetrs/config.yaml exists from the first run on, and so a
+    // malformed file is reported before any setting is read. Every subcommand
+    // goes through here, including --search, which is cheap and harmless.
+    config::init()?;
+
     // Read-only queries don't touch the audio device, so they run without the
     // single-instance lock — you can search while a recording is in progress.
     let args: Vec<String> = std::env::args().skip(1).collect();

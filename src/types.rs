@@ -34,14 +34,18 @@ pub const DEFAULT_SILENCE_RMS: f32 = 0.02;
 /// signature. Promote it to a real flag if anything else ever needs configuring.
 pub const SILENCE_RMS_ENV: &str = "MEETRS_SILENCE_RMS";
 
-/// Silence threshold, honoring `MEETRS_SILENCE_RMS` if it parses as a positive
-/// float. A malformed value is ignored rather than fatal — a typo in an env var
-/// should not stop a recording that is about to start.
+/// RMS-fallback silence threshold (see `DEFAULT_SILENCE_RMS`; normal chunking
+/// uses the VAD and does not read this). Precedence: `MEETRS_SILENCE_RMS`, then
+/// `silence_rms` in `~/.meetrs/config.yaml`, then `DEFAULT_SILENCE_RMS`. A malformed env value is
+/// ignored rather than fatal, since a typo in an env var should not stop a
+/// recording that is about to start. The config file is validated at startup,
+/// so a bad value there never gets this far.
 pub fn silence_threshold() -> f32 {
     std::env::var(SILENCE_RMS_ENV)
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| *v > 0.0 && v.is_finite())
+        .or(crate::config::get().silence_rms)
         .unwrap_or(DEFAULT_SILENCE_RMS)
 }
 

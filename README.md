@@ -151,7 +151,19 @@ zero-samples bug — if the system leg reports bit-exact zero while audio is aud
 playing, that's the bug, not a quiet room.
 
 `MEETRS_SILENCE_RMS` still exists but only feeds the RMS fallback path, used if
-the VAD fails to initialize. It has no effect on normal operation.
+the VAD fails to initialize. It has no effect on normal operation. The same
+setting can live in the config file below as `silence_rms`.
+
+## Configuration
+
+meetrs reads `~/.meetrs/config.yaml`. The first run creates it with every key
+commented out, so the built-in defaults apply until you uncomment one. meetrs
+never rewrites the file after that, so your edits survive upgrades. An unknown
+key or a malformed value stops startup and names the file and the problem.
+
+| Key | Default | Effect |
+|---|---|---|
+| `silence_rms` | `0.02` | RMS threshold for the fallback path only (see above). Overridden by `MEETRS_SILENCE_RMS`. |
 
 ## How chunking works
 

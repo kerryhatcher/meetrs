@@ -183,14 +183,18 @@ upload:
     interval_secs: 300       # optional; how often changed files are sent (min 30)
 ```
 
-The access key stays out of the file. Put it in the environment:
+The access key stays out of the file. It goes in the environment, and `just run`
+injects it from a SOPS-encrypted env file, `~/secrets/meetrs.env` by default
+(override with `MEETRS_SECRETS`):
 
 ```sh
-export MEETRS_R2_ACCESS_KEY_ID=...
-export MEETRS_R2_SECRET_ACCESS_KEY=...
-# only for temporary credentials:
-export MEETRS_R2_SESSION_TOKEN=...
+sops ~/secrets/meetrs.env   # add MEETRS_R2_ACCESS_KEY_ID and MEETRS_R2_SECRET_ACCESS_KEY
+just run
 ```
+
+The variables live only in meetrs' process. `MEETRS_R2_SESSION_TOKEN` is also
+read, for temporary credentials. Run `meetrs` directly and the same variables
+must be set in the environment yourself.
 
 If `enabled` is true and a credential is missing, meetrs prints a warning and
 records without uploading. A bad value in the config file still stops startup. A failed upload is reported and retried on the next pass. The files stay

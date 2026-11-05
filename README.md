@@ -206,7 +206,9 @@ FLAC files, because the final pass does not delete anything.
 ## How chunking works
 
 A chunk ends after `SILENCE_TO_CUT` (2s) of continuous audio below the RMS
-threshold, or at `MAX_CHUNK` (5min) regardless — a monologue still bounds crash
+threshold, or at `MAX_CHUNK` (5min) regardless, or before its WAV would pass
+`MAX_CHUNK_BYTES` (99 MB). The size cut keeps every chunk, and the FLAC made from
+it, under the 99 MB limit of the planned upload backend — a monologue still bounds crash
 loss. Chunks under `MIN_CHUNK` (750ms) are discarded rather than written, so a
 stray cough between two pauses doesn't leave a file behind.
 

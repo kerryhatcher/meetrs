@@ -9,6 +9,7 @@
 //! secret is not sitting in plaintext in the file a user might paste into a bug
 //! report.
 
+use crate::types::MAX_CHUNK_BYTES;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -172,6 +173,18 @@ impl Uploader {
                 }
             };
             for (file, stamp) in changed {
+                if stamp.len > MAX_CHUNK_BYTES {
+                    // The planned backend rejects this size. Mark it as seen, so later
+                    // passes do not report it again, and leave it on disk.
+                    errors.push(format!(
+                        "{}: {} MB is over the {} MB limit, not uploaded",
+                        file.display(),
+                        stamp.len / 1_000_000,
+                        MAX_CHUNK_BYTES / 1_000_000
+                    ));
+                    sent.insert(file, stamp);
+                    continue;
+                }
                 match self.put_file(dir, &file) {
                     Ok(()) => {
                         sent.insert(file, stamp);
@@ -707,5 +720,43 @@ mod periodic_tests {
     fn a_missing_root_has_no_sessions() {
         let root = std::env::temp_dir().join("meetrs-r2-no-such-root-xyz");
         assert!(sessions_since(&root, "2026").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_file_is_refused_once_and_never_sent() {
+        let dir = std::env::temp_dir().join(format!("meetrs-r2-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Sparse, so this takes no real disk. No request is made: the size check
+        // comes before any network work.
+        let big = dir.join("session-full.flac");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_CHUNK_BYTES + 1)
+            .unwrap();
+
+        let uploader = Uploader::new(
+            Target::new("acct", "bucket", ""),
+            Credentials {
+                access_key_id: "x".into(),
+                secret_access_key: "y".into(),
+                session_token: None,
+            },
+        );
+        let mut sent = Sent::new();
+        let first = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("over the 99 MB limit"), "{}", first[0]);
+        assert!(sent.contains_key(&big));
+
+        // Unchanged on the next pass, so it is not reported again.
+        let second = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent);
+        assert!(second.is_empty(), "{second:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

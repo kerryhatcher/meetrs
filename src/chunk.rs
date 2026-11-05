@@ -7,7 +7,8 @@
 //!   pub fn run(consumer, info, dir, tx: mpsc::Sender<Status>, jobs: mpsc::Sender<Job>, stop: StopFlag) -> Result<Summary>
 
 use crate::types::{
-    CaptureInfo, IDLE_ROLLOVER, Job, MAX_CHUNK, MIN_CHUNK, SILENCE_TO_CUT, Status, next_midnight,
+    CaptureInfo, IDLE_ROLLOVER, Job, MAX_CHUNK, MAX_CHUNK_BYTES, MIN_CHUNK, SILENCE_TO_CUT, Status,
+    next_midnight,
     session_dir,
 };
 use crate::vad::Vad;
@@ -49,7 +50,7 @@ pub struct Summary {
 enum Cut {
     /// Silence exceeded SILENCE_TO_CUT: close the current chunk (if any speech was captured).
     Silence,
-    /// MAX_CHUNK reached: force a cut regardless of silence state.
+    /// MAX_CHUNK or MAX_CHUNK_BYTES reached: force a cut regardless of silence state.
     HardCap,
 }
 
@@ -59,6 +60,8 @@ enum Cut {
 struct Chunker {
     silence_to_cut: Duration,
     max_chunk: Duration,
+    /// Frames an open chunk may hold before it is cut for size. See MAX_CHUNK_BYTES.
+    max_frames: u64,
     /// Frames of continuous silence seen since the last non-silent frame.
     silence_frames: u64,
     /// Frames written (or pending) in the current open chunk, silence included.
@@ -75,10 +78,17 @@ struct Chunker {
 }
 
 impl Chunker {
-    fn new(sample_rate: u32) -> Self {
+    fn new(sample_rate: u32, channels: u16) -> Self {
+        // 32-bit float, so four bytes per channel per frame. One second of
+        // frames is held back for the pre-roll and for the batch that crosses
+        // the limit, so the file stays under MAX_CHUNK_BYTES.
+        let bytes_per_frame = channels.max(1) as u64 * 4;
+        let max_frames =
+            (MAX_CHUNK_BYTES / bytes_per_frame).saturating_sub(sample_rate as u64);
         Chunker {
             silence_to_cut: SILENCE_TO_CUT,
             max_chunk: MAX_CHUNK,
+            max_frames,
             silence_frames: 0,
             chunk_frames: 0,
             speech_frames: 0,
@@ -110,7 +120,10 @@ impl Chunker {
             self.chunk_frames += frames;
         }
 
-        if self.open && self.frames_to_duration(self.chunk_frames) >= self.max_chunk {
+        if self.open
+            && (self.frames_to_duration(self.chunk_frames) >= self.max_chunk
+                || self.chunk_frames >= self.max_frames)
+        {
             return Some(Cut::HardCap);
         }
 
@@ -351,7 +364,7 @@ fn record(
     let mut closed_chunks: u32 = 0;
     let mut closed_total = Duration::ZERO;
 
-    let mut chunker = Chunker::new(info.sample_rate);
+    let mut chunker = Chunker::new(info.sample_rate, info.channels);
     // Last known per-leg speech decision — carried across batches so a batch
     // too small to complete a VAD frame doesn't spuriously read as silence.
     let mut last_mic_speech = false;
@@ -1224,7 +1237,7 @@ mod tests {
 
     #[test]
     fn short_silence_does_not_cut() {
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
         // silence shorter than SILENCE_TO_CUT (2s)
         assert!(silent_frames(&mut c, 1.0).is_none());
@@ -1232,7 +1245,7 @@ mod tests {
 
     #[test]
     fn long_silence_cuts() {
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
         let cut = silent_frames(&mut c, 2.5);
         assert_eq!(cut, Some(Cut::Silence));
@@ -1242,7 +1255,7 @@ mod tests {
     fn no_cut_without_speech_during_long_silence() {
         // Pure silence from the start: chunk never opens, so nothing to cut,
         // and no empty chunk should ever be created by the caller.
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         let cut = silent_frames(&mut c, 10.0);
         assert!(cut.is_none());
         assert!(!c.open);
@@ -1250,7 +1263,7 @@ mod tests {
 
     #[test]
     fn hard_cap_fires_with_no_silence() {
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
         // Keep feeding loud audio past MAX_CHUNK (300s) with zero silence.
         let cut = loud_frames(&mut c, 300.0);
@@ -1263,7 +1276,7 @@ mod tests {
         // on disk is speech + a bounded 300ms trailing-silence tail (mirrors the
         // hold-buffer trim in `run`), not the full silence run — that combined
         // duration should fall under MIN_CHUNK so the caller discards it.
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 0.1).is_none()); // 100ms of speech
         let cut = silent_frames(&mut c, 2.5);
         assert_eq!(cut, Some(Cut::Silence));
@@ -1277,7 +1290,7 @@ mod tests {
 
     #[test]
     fn reset_after_cut_allows_reopening() {
-        let mut c = Chunker::new(SR);
+        let mut c = Chunker::new(SR, 1);
         assert!(loud_frames(&mut c, 1.0).is_none());
         assert_eq!(silent_frames(&mut c, 2.5), Some(Cut::Silence));
         c.reset_after_cut();
@@ -1286,5 +1299,29 @@ mod tests {
         // Speech resumes and a fresh chunk can open again.
         assert!(loud_frames(&mut c, 0.5).is_none());
         assert!(c.open);
+    }
+}
+
+#[cfg(test)]
+mod size_cap_tests {
+    use super::*;
+
+    #[test]
+    fn a_three_channel_chunk_is_cut_before_it_passes_the_byte_limit() {
+        // Continuous speech, so only the size limit can cut. Three channels of
+        // 32-bit float is what the recorder writes.
+        let mut c = Chunker::new(48_000, 3);
+        let mut cut = None;
+        for _ in 0..100_000 {
+            if c.feed(true, 4096) == Some(Cut::HardCap) {
+                cut = Some(c.chunk_frames);
+                break;
+            }
+        }
+        let frames = cut.expect("a long unbroken chunk must be cut");
+        let bytes = frames * 3 * 4;
+        assert!(bytes <= MAX_CHUNK_BYTES, "{bytes} bytes is over the limit");
+        // Not early either: the cut lands within a second of the budget.
+        assert!(bytes + 48_000 * 12 > MAX_CHUNK_BYTES, "cut too early at {bytes} bytes");
     }
 }

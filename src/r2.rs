@@ -14,8 +14,9 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
@@ -69,8 +70,13 @@ impl Credentials {
     }
 }
 
+/// The variable's value without surrounding whitespace, or None if it is empty.
+/// A trailing newline pasted into a secret would otherwise break the signature.
 fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Where uploads go: `<bucket>/<prefix><session>/<file>` on the account's R2
@@ -152,14 +158,21 @@ impl Uploader {
     /// last saw it. `active` is the session still being recorded: its newest
     /// WAV is skipped because that chunk is still being written. Returns the
     /// errors. A failed file is left out of `sent`, so the next pass retries it.
+    /// `halt`, when set, is checked before each file, so a stop request waits for
+    /// at most the file in flight rather than the whole pass.
     pub fn upload_pass(
         &self,
         sessions: &[PathBuf],
         active: Option<&Path>,
         sent: &mut Sent,
+        halt: Option<&AtomicBool>,
     ) -> Vec<String> {
+        let halted = || halt.is_some_and(|h| h.load(Ordering::Relaxed));
         let mut errors = Vec::new();
         for dir in sessions {
+            if halted() {
+                return errors;
+            }
             let skip = if active == Some(dir.as_path()) {
                 newest_wav(dir)
             } else {
@@ -173,16 +186,18 @@ impl Uploader {
                 }
             };
             for (file, stamp) in changed {
+                if halted() {
+                    return errors;
+                }
                 if stamp.len > max_chunk_bytes() {
-                    // The planned backend rejects this size. Mark it as seen, so later
-                    // passes do not report it again, and leave it on disk.
+                    // Refused every pass and never counted as sent. The periodic
+                    // thread reports it once, not on every pass.
                     errors.push(format!(
                         "{}: {} MB is over the {} MB limit, not uploaded",
                         file.display(),
                         stamp.len / 1_000_000,
                         max_chunk_bytes() / 1_000_000
                     ));
-                    sent.insert(file, stamp);
                     continue;
                 }
                 match self.put_file(dir, &file) {
@@ -212,7 +227,13 @@ impl Uploader {
     fn put_file(&self, session_dir: &Path, path: &Path) -> Result<()> {
         let key = self.key_for(session_dir, path)?;
         let encoded = encode_path(&key);
-        let payload_sha256 = sha256_file_hex(path)?;
+        // One open handle serves both the hash and the body, so the signed hash
+        // always describes the bytes that go out, even if the file changes.
+        let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let payload_sha256 =
+            sha256_reader_hex(&mut file).with_context(|| format!("hashing {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("rewinding {}", path.display()))?;
         let now = chrono::Utc::now();
         let headers = sign_put(
             &self.creds,
@@ -228,7 +249,6 @@ impl Uploader {
             self.target.host(),
             self.target.object_path(&encoded)
         );
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mut request = self.agent.put(&url);
         for (name, value) in &headers {
             request = request.header(name.as_str(), value.as_str());
@@ -288,10 +308,17 @@ fn stamp(path: &Path) -> Result<Stamp> {
 
 /// The highest-indexed WAV in `dir`: the chunk most likely still being written.
 pub fn newest_wav(dir: &Path) -> Option<PathBuf> {
+    // Names are chunk-NNN.wav, zero-padded to three digits. Past chunk 999 the name
+    // grows, so compare by length first to keep chunk-1000 later than chunk-999.
     session_files(dir)
         .ok()?
         .into_iter()
-        .rfind(|p| p.extension().is_some_and(|e| e == "wav"))
+        .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+        .max_by(|a, b| {
+            let a = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let b = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+        })
 }
 
 /// Session directories under `root` whose names sort at or after `since`,
@@ -323,15 +350,16 @@ pub struct PeriodicResult {
 /// A running periodic-upload thread.
 pub struct Periodic {
     stop: mpsc::Sender<()>,
+    halt: Arc<AtomicBool>,
     handle: JoinHandle<PeriodicResult>,
 }
 
 impl Periodic {
-    /// Stop the thread after its current pass, if any, and collect its result.
-    /// Any pass in flight is finished first, so this can block for as long as
-    /// one upload takes.
+    /// Stop the thread and collect its result. It finishes the file it is sending,
+    /// then starts no more, so this waits for at most one upload, not a whole pass.
     pub fn finish(self) -> PeriodicResult {
-        let Periodic { stop, handle } = self;
+        let Periodic { stop, halt, handle } = self;
+        halt.store(true, Ordering::Relaxed);
         drop(stop);
         handle.join().unwrap_or_else(|_| PeriodicResult {
             errors: vec!["periodic upload thread panicked".into()],
@@ -353,11 +381,16 @@ pub fn spawn_periodic(
     interval: Duration,
 ) -> Result<Periodic> {
     let (stop, stop_rx) = mpsc::channel::<()>();
+    let halt = Arc::new(AtomicBool::new(false));
+    let thread_halt = Arc::clone(&halt);
     let handle = std::thread::Builder::new()
         .name("meetrs-upload".into())
         .spawn(move || {
             let mut sent = Sent::new();
             let mut errors = Vec::new();
+            // The same refusal or failure would otherwise be reported on every
+            // pass. Each distinct message is kept once.
+            let mut reported = std::collections::HashSet::new();
             // Any outcome other than a timeout means stop: the sender was dropped
             // by `finish`, or a message arrived.
             while let Err(mpsc::RecvTimeoutError::Timeout) = stop_rx.recv_timeout(interval) {
@@ -365,12 +398,18 @@ pub fn spawn_periodic(
                 // The newest session is the one being recorded. Earlier ones
                 // have closed, so every file in them is final.
                 let active = sessions.last().cloned();
-                errors.extend(uploader.upload_pass(&sessions, active.as_deref(), &mut sent));
+                let pass = uploader.upload_pass(
+                    &sessions,
+                    active.as_deref(),
+                    &mut sent,
+                    Some(&thread_halt),
+                );
+                errors.extend(pass.into_iter().filter(|e| reported.insert(e.clone())));
             }
             PeriodicResult { errors, sent }
         })
         .context("spawning upload thread")?;
-    Ok(Periodic { stop, handle })
+    Ok(Periodic { stop, halt, handle })
 }
 
 /// Percent-encode an object key for the URI, keeping `/` as the separator.
@@ -477,15 +516,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Hash a file in fixed-size reads, so a long chunk is never held in memory.
-fn sha256_file_hex(path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+fn sha256_reader_hex(reader: &mut impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let n = reader.read(&mut buf).context("reading file for hashing")?;
         if n == 0 {
             break;
         }
@@ -683,6 +718,37 @@ mod periodic_tests {
     }
 
     #[test]
+    fn a_halted_pass_starts_no_file() {
+        let dir = scratch("halt");
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        let uploader = Uploader::new(
+            Target::new("0123456789abcdef0123456789abcdef", "bucket", ""),
+            Credentials {
+                access_key_id: "x".into(),
+                secret_access_key: "y".into(),
+                session_token: None,
+            },
+        );
+        let halt = AtomicBool::new(true);
+        let mut sent = Sent::new();
+        // With the halt already set, no file is opened or sent, so no request is made.
+        let errors = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent, Some(&halt));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(sent.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_newest_wav_stays_the_newest_past_chunk_999() {
+        let dir = scratch("newest");
+        for name in ["chunk-999.wav", "chunk-1000.wav", "chunk-1001.wav"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let newest = newest_wav(&dir).unwrap();
+        assert!(newest.ends_with("chunk-1001.wav"), "{}", newest.display());
+    }
+
+    #[test]
     fn the_skipped_file_is_left_out_even_when_new() {
         let dir = scratch("skip");
         std::fs::write(dir.join("chunk-000.wav"), b"a").unwrap();
@@ -749,14 +815,16 @@ mod size_limit_tests {
             },
         );
         let mut sent = Sent::new();
-        let first = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent);
+        let first = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent, None);
         assert_eq!(first.len(), 1, "{first:?}");
         assert!(first[0].contains("over the 99 MB limit"), "{}", first[0]);
-        assert!(sent.contains_key(&big));
+        // Refused and never counted as sent, so the summary stays honest.
+        assert!(!sent.contains_key(&big));
 
-        // Unchanged on the next pass, so it is not reported again.
-        let second = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent);
-        assert!(second.is_empty(), "{second:?}");
+        // Refused again on the next pass, and still not sent.
+        let second = uploader.upload_pass(std::slice::from_ref(&dir), None, &mut sent, None);
+        assert_eq!(second.len(), 1);
+        assert!(!sent.contains_key(&big));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

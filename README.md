@@ -151,12 +151,69 @@ zero-samples bug — if the system leg reports bit-exact zero while audio is aud
 playing, that's the bug, not a quiet room.
 
 `MEETRS_SILENCE_RMS` still exists but only feeds the RMS fallback path, used if
-the VAD fails to initialize. It has no effect on normal operation.
+the VAD fails to initialize. It has no effect on normal operation. The same
+setting can live in the config file below as `silence_rms`.
+
+## Configuration
+
+meetrs reads `~/.meetrs/config.yaml`. The first run creates it with every key
+commented out, so the built-in defaults apply until you uncomment one. meetrs
+never rewrites the file after that, so your edits survive upgrades. An unknown
+key or a malformed value stops startup and names the file and the problem.
+
+| Key | Default | Effect |
+|---|---|---|
+| `silence_rms` | `0.02` | RMS threshold for the fallback path only (see above). Overridden by `MEETRS_SILENCE_RMS`. |
+| `max_chunk_secs` | `150` | Seconds of continuous speech before a chunk is closed. Minimum 10. |
+| `max_chunk_bytes` | `99000000` | Largest a chunk's WAV may grow, and the largest file the uploader sends. Minimum 10000000. |
+
+The two chunk limits are written to the file on startup with their defaults, if
+the file does not already set them, so they show up as options.
+
+### Uploading to Cloudflare R2
+
+Session files can be uploaded to an R2 bucket. Every `interval_secs` (default
+300) whatever changed is sent, so a crash loses at most that much. A final pass
+runs when recording stops, after transcription and compression. Uploads run on
+their own thread and never delay recording. It is off by default. To turn it on, set `upload.r2` in the
+config file:
+
+```yaml
+upload:
+  r2:
+    enabled: true
+    account_id: <your Cloudflare account id>
+    bucket: hatcher-meetrs
+    prefix: meetings/        # optional; keys become meetings/<session>/<file>
+    interval_secs: 300       # optional; how often changed files are sent (min 30)
+```
+
+The access key stays out of the file. It goes in the environment, and `just run`
+injects it from a SOPS-encrypted env file, `~/secrets/meetrs.env` by default
+(override with `MEETRS_SECRETS`):
+
+```sh
+sops ~/secrets/meetrs.env   # add MEETRS_R2_ACCESS_KEY_ID and MEETRS_R2_SECRET_ACCESS_KEY
+just run
+```
+
+The variables live only in meetrs' process. `MEETRS_R2_SESSION_TOKEN` is also
+read, for temporary credentials. Run `meetrs` directly and the same variables
+must be set in the environment yourself.
+
+If `enabled` is true and a credential is missing, meetrs prints a warning and
+records without uploading. A bad value in the config file still stops startup. A failed upload is reported and retried on the next pass. The files stay
+on disk, and uploads overwrite the same keys, so retrying is safe.
+
+Compressed sessions leave their original WAV objects in the bucket next to the
+FLAC files, because the final pass does not delete anything.
 
 ## How chunking works
 
 A chunk ends after `SILENCE_TO_CUT` (2s) of continuous audio below the RMS
-threshold, or at `MAX_CHUNK` (5min) regardless — a monologue still bounds crash
+threshold, or after `max_chunk_secs` (2.5 min) of continuous speech, or before its
+WAV would pass `max_chunk_bytes` (99 MB). The size cut keeps every chunk, and the FLAC made from
+it, under the 99 MB limit of the planned upload backend — a monologue still bounds crash
 loss. Chunks under `MIN_CHUNK` (750ms) are discarded rather than written, so a
 stray cough between two pauses doesn't leave a file behind.
 

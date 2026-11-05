@@ -15,8 +15,32 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// A natural conversational pause, not an inter-word gap.
 pub const SILENCE_TO_CUT: Duration = Duration::from_secs(2);
 
-/// Force a cut regardless of silence, so a monologue still bounds crash loss.
-pub const MAX_CHUNK: Duration = Duration::from_secs(300);
+/// Default for `max_chunk_secs` in config.yaml. Force a cut after this much
+/// continuous speech, so a monologue still bounds crash loss.
+pub const DEFAULT_MAX_CHUNK: Duration = Duration::from_secs(150);
+
+/// Default for `max_chunk_bytes` in config.yaml. The largest a chunk's WAV may
+/// grow. The writer cuts before passing it, so the chunk and the FLAC made from
+/// it stay under 99 MB, and the uploader will not send a larger file. The planned
+/// upload backend rejects anything bigger.
+pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 99_000_000;
+
+/// Force a cut after this much continuous speech. Config `max_chunk_secs`, else
+/// `DEFAULT_MAX_CHUNK`.
+pub fn max_chunk() -> Duration {
+    crate::config::get()
+        .max_chunk_secs
+        .map(Duration::from_secs_f64)
+        .unwrap_or(DEFAULT_MAX_CHUNK)
+}
+
+/// The size limit for a chunk's WAV, and for any file the uploader sends. Config
+/// `max_chunk_bytes`, else `DEFAULT_MAX_CHUNK_BYTES`.
+pub fn max_chunk_bytes() -> u64 {
+    crate::config::get()
+        .max_chunk_bytes
+        .unwrap_or(DEFAULT_MAX_CHUNK_BYTES)
+}
 
 /// Below this RMS (linear, not dB) a block counts as silence.
 ///
@@ -34,14 +58,18 @@ pub const DEFAULT_SILENCE_RMS: f32 = 0.02;
 /// signature. Promote it to a real flag if anything else ever needs configuring.
 pub const SILENCE_RMS_ENV: &str = "MEETRS_SILENCE_RMS";
 
-/// Silence threshold, honoring `MEETRS_SILENCE_RMS` if it parses as a positive
-/// float. A malformed value is ignored rather than fatal — a typo in an env var
-/// should not stop a recording that is about to start.
+/// RMS-fallback silence threshold (see `DEFAULT_SILENCE_RMS`; normal chunking
+/// uses the VAD and does not read this). Precedence: `MEETRS_SILENCE_RMS`, then
+/// `silence_rms` in `~/.meetrs/config.yaml`, then `DEFAULT_SILENCE_RMS`. A malformed env value is
+/// ignored rather than fatal, since a typo in an env var should not stop a
+/// recording that is about to start. The config file is validated at startup,
+/// so a bad value there never gets this far.
 pub fn silence_threshold() -> f32 {
     std::env::var(SILENCE_RMS_ENV)
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|v| *v > 0.0 && v.is_finite())
+        .or(crate::config::get().silence_rms)
         .unwrap_or(DEFAULT_SILENCE_RMS)
 }
 

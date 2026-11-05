@@ -8,9 +8,11 @@
 mod capture;
 mod chunk;
 mod compress;
+mod config;
 mod db;
 mod lock;
 mod model;
+mod r2;
 mod tcc;
 mod transcribe;
 mod types;
@@ -21,6 +23,42 @@ use anyhow::{Context, Result};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Flags the first argument may be. Anything else starting with `-` is an error.
+const KNOWN_FLAGS: &[&str] = &[
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+    "--search",
+    "--reindex",
+    "--upload",
+    "--compress",
+    "--check",
+];
+
+const HELP: &str = "\
+meetrs: terminal meeting recorder. Captures microphone and system audio in
+chunks, and transcribes each chunk locally.
+
+usage:
+  meetrs                        record until you quit (Ctrl-C or q)
+  meetrs --search <query>       full-text search across every transcript
+  meetrs --reindex              rebuild the search index from the files on disk
+  meetrs --upload [dir...]      send sessions to R2 now (default: every session)
+  meetrs --compress [dir...]    compress older sessions to FLAC
+  meetrs --check                measure input levels to choose a silence threshold
+  meetrs -h, --help             show this help
+  meetrs -V, --version          show the version
+
+files:
+  ~/.meetrs/config.yaml         settings, created on first run
+  ~/.meetrs/recordings/         one directory per session
+  ~/.meetrs/meetrs.db           search index (derived, rebuildable)
+
+R2 uploads read their credentials from MEETRS_R2_ACCESS_KEY_ID and
+MEETRS_R2_SECRET_ACCESS_KEY. `just run` and `just upload` load them from SOPS.
+";
+
 /// Ring buffer capacity in samples. At 48kHz × 4ch that is ~4 seconds of slack
 /// between the realtime callback and the writer thread — generous, because the
 /// cost of overrun is corrupt audio and the cost of the memory is 3MB.
@@ -28,12 +66,39 @@ const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Answered before anything else: no config file is created, no lock is taken,
+    // no audio device is touched, so these work while a recording is running.
+    match args.first().map(String::as_str) {
+        Some("-h" | "--help") => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("meetrs {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        // Without this, a mistyped flag, or a word such as `upload` with no dash,
+        // would fall through to the recorder and start a session the user did not
+        // ask for. Only the known flags may start anything.
+        Some(arg) if !KNOWN_FLAGS.contains(&arg) => {
+            anyhow::bail!("unknown option or command {arg}; run `meetrs --help` for the list");
+        }
+        _ => {}
+    }
+
+    // So ~/.meetrs/config.yaml exists from the first run on, and so a malformed
+    // file is reported before any setting is read. Subcommands below go through
+    // here too, including --search, which is cheap and harmless.
+    config::init()?;
+
     // Read-only queries don't touch the audio device, so they run without the
     // single-instance lock — you can search while a recording is in progress.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--search") => return search(&args[1..].join(" ")),
         Some("--reindex") => return reindex(),
+        Some("--upload") => return upload_old(&args[1..]),
         _ => {}
     }
 
@@ -73,6 +138,10 @@ fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--check") {
         return check();
     }
+
+    // Built before anything is recorded. A missing credential only switches
+    // uploads off, with a warning: the recording matters more than the copy.
+    let uploader = uploader_from_config()?.map(std::sync::Arc::new);
 
     // Fail before touching the terminal, so errors are readable.
     let started = chrono::Local::now();
@@ -144,6 +213,26 @@ fn main() -> Result<()> {
         .spawn(move || transcribe::run(jobs_rx, model, asr_tx))
         .context("spawning transcribe thread")?;
 
+    // Periodic uploads of whatever has changed, so a crash loses at most one
+    // interval. They run beside recording and never block it.
+    let periodic = match &uploader {
+        Some(u) => {
+            let interval = Duration::from_secs(config::get().upload.r2.interval_secs);
+            let root = types::recordings_dir()?;
+            let since = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(r2::spawn_periodic(
+                std::sync::Arc::clone(u),
+                root,
+                since,
+                interval,
+            )?)
+        }
+        None => None,
+    };
+
     let outcome = ui::run(rx, &dir, info, &stop);
 
     // Always stop capture and the writer and join, even if the UI failed, so
@@ -153,6 +242,19 @@ fn main() -> Result<()> {
     let write_result = writer
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+
+    // Stop periodic uploads before anything is printed, so their errors can't
+    // land on the TUI. The final pass below reuses what they already sent.
+    let (periodic_errors, mut sent) = match periodic {
+        Some(p) => {
+            let r = p.finish();
+            (r.errors, r.sent)
+        }
+        None => (Vec::new(), r2::Sent::new()),
+    };
+    for e in &periodic_errors {
+        eprintln!("meetrs: upload during recording: {e}");
+    }
 
     // Restore the terminal before reporting anything.
     outcome?;
@@ -189,6 +291,12 @@ fn main() -> Result<()> {
         }
     } else {
         eprintln!("skipping compression: chunks may still need re-transcribing");
+    }
+
+    // Upload whatever is on disk, whether or not transcription finished: the
+    // audio is the part worth keeping off this machine.
+    if let Some(uploader) = &uploader {
+        upload_sessions(uploader, &summary.sessions, &mut sent);
     }
 
     for session in &summary.sessions {
@@ -253,6 +361,115 @@ fn compress_old(dirs: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The R2 uploader, if `upload.r2` is enabled in the config. Credentials come
+/// from the environment. When they are missing, uploads are switched off with a
+/// warning and recording goes ahead. Problems in the config file itself are
+/// still fatal, since those are mistakes the user made in writing it.
+fn uploader_from_config() -> Result<Option<r2::Uploader>> {
+    let cfg = &config::get().upload.r2;
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let creds = match r2::Credentials::from_env() {
+        Ok(creds) => creds,
+        Err(e) => {
+            eprintln!("meetrs: warning: R2 upload is off, recording without it ({e:#})");
+            return Ok(None);
+        }
+    };
+    Ok(Some(r2::Uploader::new(r2_target(cfg), creds)))
+}
+
+fn r2_target(cfg: &config::R2Upload) -> r2::Target {
+    r2::Target::new(
+        cfg.account_id.as_deref().unwrap_or(""),
+        cfg.bucket.as_deref().unwrap_or(""),
+        &cfg.prefix,
+    )
+}
+
+/// `--upload [dir...]`: send session directories to R2 now, the same way the
+/// recorder does during and after a run. With no arguments it sends every
+/// session under `~/.meetrs/recordings`. Unlike recording, this is explicit, so
+/// a missing setting is an error rather than a warning. Read-only on the local
+/// files, so it takes no lock.
+fn upload_old(dirs: &[String]) -> Result<()> {
+    let cfg = &config::get().upload.r2;
+    anyhow::ensure!(
+        cfg.enabled,
+        "upload.r2 is not enabled in {}",
+        config::path()?.display()
+    );
+    let creds = r2::Credentials::from_env().context("R2 credentials are needed to upload")?;
+    let uploader = r2::Uploader::new(r2_target(cfg), creds);
+
+    let sessions: Vec<std::path::PathBuf> = if dirs.is_empty() {
+        compress::sessions()?
+    } else {
+        dirs.iter().map(std::path::PathBuf::from).collect()
+    };
+    if sessions.is_empty() {
+        println!("no sessions to upload");
+        return Ok(());
+    }
+    println!(
+        "uploading {} session(s) to r2://{}/{}",
+        sessions.len(),
+        cfg.bucket.as_deref().unwrap_or(""),
+        cfg.prefix
+    );
+
+    // One session at a time so progress shows on a long backfill. The map is
+    // shared across them, so a file that appears twice is still sent once.
+    let mut sent = r2::Sent::new();
+    let mut failures = 0usize;
+    for (i, dir) in sessions.iter().enumerate() {
+        let before = sent.len();
+        let errors = uploader.upload_pass(std::slice::from_ref(dir), None, &mut sent, None);
+        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        println!(
+            "[{}/{}] {}: {} file(s){}",
+            i + 1,
+            sessions.len(),
+            name.unwrap_or_else(|| dir.display().to_string()),
+            sent.len() - before,
+            if errors.is_empty() {
+                ""
+            } else {
+                " (with errors)"
+            }
+        );
+        for e in &errors {
+            eprintln!("meetrs: {e}");
+        }
+        failures += errors.len();
+    }
+    println!("sent {} file(s); {failures} error(s)", sent.len());
+    anyhow::ensure!(
+        failures == 0,
+        "{failures} upload error(s); re-run to retry them"
+    );
+    Ok(())
+}
+
+/// Final upload after the recording and compression are done. Anything the
+/// periodic passes already sent and that has not changed is skipped. What is
+/// left is what changed afterwards: the compressed FLACs, and the transcript
+/// after its last chunk. A failure is reported. The audio stays on disk.
+fn upload_sessions(uploader: &r2::Uploader, sessions: &[std::path::PathBuf], sent: &mut r2::Sent) {
+    let errors = uploader.upload_pass(sessions, None, sent, None);
+    for e in &errors {
+        eprintln!("meetrs: upload failed: {e}");
+    }
+    if errors.is_empty() && !sessions.is_empty() {
+        println!(
+            "uploaded {} session(s) to bucket {}",
+            sessions.len(),
+            uploader.target.bucket
+        );
+    }
 }
 
 /// Shrink the session's WAVs to FLAC. Recording and transcription are already

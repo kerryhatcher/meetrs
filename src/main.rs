@@ -732,18 +732,7 @@ fn check() -> Result<()> {
         // from here, so report which one it was instead of just the symptom.
         let io = capture::io_stats();
         let why = if io.calls == 0 {
-            // Registration always passes a real serial dispatch queue and rejects
-            // a null IOProc ID, so the macOS 26 nil-queue no-op is ruled out by
-            // construction. Tap autostart is off, so the mic drives cycles even on
-            // a silent machine; zero callbacks means the device never ran. If
-            // autostart ever gets switched back on, a silent machine looks
-            // exactly like this (coreaudiod logs `register_autostart_context`
-            // and then never starts IO). Otherwise it is a TCC denial (see
-            // src/tcc.rs), where AudioDeviceStart still returns noErr.
-            // `/usr/bin/log` rather than `log`: zsh has a `log` builtin.
-            "the IOProc was never invoked. Check whether the tap was denied with:\n  \
-             /usr/bin/log show --last 2m --predicate 'process == \"coreaudiod\"' | grep -i tap\n  \
-             \"Client is not granted access to the tap\" = denied"
+            no_callbacks_hint()
         } else if io.shape_mismatch == io.calls {
             "every cycle was dropped because the device's buffer count disagreed with \
              the stream layout discovered at start()"
@@ -780,6 +769,7 @@ fn check() -> Result<()> {
         // (mic allowed, tap refused, because terminals carry
         // NSMicrophoneUsageDescription but not NSAudioCaptureUsageDescription),
         // and only once both are ruled out is this the Core Audio bug.
+        #[cfg(target_os = "macos")]
         println!(
             "\nWARNING: system leg is bit-exact zero across {frames} frames.\n\
              Most likely nothing was playing — retry with audio playing, since a silent \
@@ -790,8 +780,44 @@ fn check() -> Result<()> {
              docs/research/rust-audio-macos.md in git history.{}",
             attribution_note()
         );
+        #[cfg(not(target_os = "macos"))]
+        println!(
+            "\nWARNING: system leg is bit-exact zero across {frames} frames.\n\
+             Most likely nothing was playing, which is not a fault: retry with audio \
+             playing. The mic keeps the cycles running while the system leg stays zero.\n\
+             If audio *was* playing, the system leg is not bound to the output you are \
+             listening to. Capture reads the default sink's monitor, bound once at start, \
+             so run `wpctl status` to confirm the default sink is the device in use, and \
+             restart meetrs after changing the default output."
+        );
     }
     Ok(())
+}
+
+/// Why a capture delivered no callbacks at all, for `--check`.
+#[cfg(target_os = "macos")]
+fn no_callbacks_hint() -> &'static str {
+    // Registration always passes a real serial dispatch queue and rejects
+    // a null IOProc ID, so the macOS 26 nil-queue no-op is ruled out by
+    // construction. Tap autostart is off, so the mic drives cycles even on
+    // a silent machine; zero callbacks means the device never ran. If
+    // autostart ever gets switched back on, a silent machine looks
+    // exactly like this (coreaudiod logs `register_autostart_context`
+    // and then never starts IO). Otherwise it is a TCC denial (see
+    // src/tcc.rs), where AudioDeviceStart still returns noErr.
+    // `/usr/bin/log` rather than `log`: zsh has a `log` builtin.
+    "the IOProc was never invoked. Check whether the tap was denied with:\n  \
+     /usr/bin/log show --last 2m --predicate 'process == \"coreaudiod\"' | grep -i tap\n  \
+     \"Client is not granted access to the tap\" = denied"
+}
+
+/// Why a capture delivered no callbacks at all, for `--check`. PipeWire's
+/// streams never started, so the usual cause is the daemon or its defaults.
+#[cfg(not(target_os = "macos"))]
+fn no_callbacks_hint() -> &'static str {
+    "PipeWire delivered no callbacks to either stream. Check that the PipeWire \
+     daemon is running and has a default audio sink and source: `wpctl status` \
+     should list both under Audio, and `pw-cli info 0` should print the core."
 }
 
 /// Names the application TCC is actually asking about, when that is not meetrs.

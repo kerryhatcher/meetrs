@@ -891,4 +891,65 @@ mod tests {
             }
         }
     }
+
+    /// Not run by `cargo test`. Times the same `transcribe_leg` path the worker
+    /// uses on a clip the caller supplies, transcribing it as both legs the way
+    /// `process_job` does for a stereo chunk:
+    ///   MEETRS_MODEL=/path/ggml-small.en-tdrz.bin MEETRS_BENCH_WAV=/path/clip.wav \
+    ///   MEETRS_BENCH_OUT=/path/transcript.txt cargo test --release \
+    ///     bench_whisper_clip -- --ignored --nocapture
+    /// The WAV must be 16-bit mono 16 kHz. RTF is wall time over clip duration
+    /// for one full pass, which is what the worker pays per chunk.
+    #[test]
+    #[ignore = "benchmark: needs a model and a WAV named by MEETRS_BENCH_WAV"]
+    fn bench_whisper_clip() {
+        let wav = std::env::var("MEETRS_BENCH_WAV").expect("set MEETRS_BENCH_WAV");
+        let runs: usize = std::env::var("MEETRS_BENCH_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let model = crate::model::ensure(|_, _| {}).unwrap();
+
+        let mut reader = hound::WavReader::open(&wav).unwrap();
+        let spec = reader.spec();
+        assert_eq!((spec.channels, spec.sample_rate), (1, 16_000));
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let audio_secs = samples.len() as f64 / 16_000.0;
+
+        let load = Instant::now();
+        let ctx =
+            WhisperContext::new_with_params(&model, WhisperContextParameters::default()).unwrap();
+        println!(
+            "BENCH model_load={:.3}s threads={} audio={audio_secs:.2}s",
+            load.elapsed().as_secs_f64(),
+            whisper_threads()
+        );
+
+        let tdrz = model_supports_tdrz(&model);
+        let mut transcript = String::new();
+        for run in 1..=runs {
+            let started = Instant::now();
+            let mic = transcribe_leg(&ctx, &samples, "mic", Duration::ZERO, tdrz).unwrap();
+            let sys = transcribe_leg(&ctx, &samples, "system", Duration::ZERO, tdrz).unwrap();
+            let wall = started.elapsed().as_secs_f64();
+            println!(
+                "BENCH run={run} wall={wall:.3}s rtf={:.4} segments_mic={} segments_sys={}",
+                wall / audio_secs,
+                mic.len(),
+                sys.len()
+            );
+            transcript = mic
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        if let Ok(out) = std::env::var("MEETRS_BENCH_OUT") {
+            std::fs::write(&out, &transcript).unwrap();
+        }
+        println!("BENCH transcript: {transcript}");
+    }
 }

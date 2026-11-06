@@ -6,7 +6,7 @@ bin := "target/" + profile + "/meetrs"
 app := bin + ".app"
 exe := app + "/Contents/MacOS/meetrs"
 
-# where `just install` puts things. appdir holds the bundle (TCC consent is keyed
+# macOS only: where `just install` puts things. appdir holds the bundle (TCC consent is keyed
 # to it, so it needs a stable home outside target/); bindir holds the PATH entry.
 appdir := env("MEETRS_APPDIR", "$HOME/Applications")
 bindir := env("MEETRS_BINDIR", "$HOME/.local/bin")
@@ -28,6 +28,7 @@ build:
     cargo build --release
 
 # rebuild the .app only when missing or the binary is newer than what's bundled
+[macos]
 bundle: build
     #!/usr/bin/env bash
     if [ ! -e "{{exe}}" ] || [ "{{bin}}" -nt "{{exe}}" ]; then
@@ -50,6 +51,7 @@ bundle: build
 # or its decryption is unavailable, the app still starts, with uploads off.
 #
 # build, install, and launch the TUI recorder
+[macos]
 run: install
     #!/usr/bin/env bash
     secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
@@ -63,17 +65,51 @@ run: install
     sops decrypt "$secrets" >/dev/null 2>&1 || start_without_uploads "could not decrypt $secrets"
     exec sops exec-env "$secrets" "\"$app\""
 
+# Same SOPS-injected R2 credentials as the macOS `run` above; no bundle or install step.
+# build, then launch the TUI recorder straight from target/release (Linux)
+[linux]
+run: build
+    #!/usr/bin/env bash
+    secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
+    app="{{bin}}"
+    start_without_uploads() {
+        echo "meetrs: WARNING: $1; starting without R2 credentials, so uploads are off" >&2
+        exec "$app"
+    }
+    command -v sops >/dev/null 2>&1 || start_without_uploads "sops is not installed"
+    [ -f "$secrets" ] || start_without_uploads "$secrets not found"
+    sops decrypt "$secrets" >/dev/null 2>&1 || start_without_uploads "could not decrypt $secrets"
+    exec sops exec-env "$secrets" "\"$app\""
+
 # build, bundle if needed, and run headless calibration (sets MEETRS_SILENCE_RMS)
+[macos]
 check: bundle
     exec "{{exe}}" --check
 
+# build, then run headless calibration: channel layout and per-leg levels (Linux)
+[linux]
+check: build
+    exec "{{bin}}" --check
+
 # full-text search every transcript: just search "budget OR headcount"
+[macos]
 search +QUERY: bundle
     exec "{{exe}}" --search {{QUERY}}
 
+# full-text search every transcript (Linux): just search "budget OR headcount"
+[linux]
+search +QUERY: build
+    exec "{{bin}}" --search {{QUERY}}
+
 # rebuild the SQLite index from the JSON on disk (safe: the DB is derived)
+[macos]
 reindex: bundle
     exec "{{exe}}" --reindex
+
+# rebuild the SQLite index from the JSON on disk (Linux; safe: the DB is derived)
+[linux]
+reindex: build
+    exec "{{bin}}" --reindex
 
 # Deletes a chunk's WAV only after its FLAC verifies; untranscribed chunks are
 # left alone. New sessions compress themselves at session end.
@@ -82,6 +118,7 @@ reindex: bundle
 # with spaces or shell characters is passed through as one argument.
 #
 # upload sessions to R2 now, with the credentials from SOPS: just upload [session-dir...]
+[macos]
 [positional-arguments]
 upload *DIRS: bundle
     #!/usr/bin/env bash
@@ -91,11 +128,29 @@ upload *DIRS: bundle
     cmd=$(printf '%q ' "{{exe}}" --upload "$@")
     exec sops exec-env "$secrets" "$cmd"
 
+# upload sessions to R2 now, with the credentials from SOPS (Linux): just upload [session-dir...]
+[linux]
+[positional-arguments]
+upload *DIRS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    secrets="${MEETRS_SECRETS:-$HOME/secrets/meetrs.env}"
+    [ -f "$secrets" ] || { echo "no credentials file at $secrets" >&2; exit 1; }
+    cmd=$(printf '%q ' "{{bin}}" --upload "$@")
+    exec sops exec-env "$secrets" "$cmd"
+
 # compress older sessions to FLAC: just compress [session-dir...]
+[macos]
 compress *DIRS: bundle
     exec "{{exe}}" --compress {{DIRS}}
 
+# compress older sessions to FLAC (Linux): just compress [session-dir...]
+[linux]
+compress *DIRS: build
+    exec "{{bin}}" --compress {{DIRS}}
+
 # install so `meetrs` works from any directory, recording included
+[macos]
 install: bundle
     #!/usr/bin/env bash
     set -euo pipefail
@@ -146,8 +201,31 @@ install: bundle
         echo "      Remove it so it can never shadow this install:  cargo uninstall meetrs"
     fi
 
+# No bundle or consent step on Linux, so this just copies the binary.
+# copy the release binary onto PATH (Linux; MEETRS_BINDIR, default ~/.local/bin)
+[linux]
+install: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="${MEETRS_BINDIR:-$HOME/.local/bin}"
+    mkdir -p "$dir"
+    install -m 0755 "{{bin}}" "$dir/meetrs"
+    echo "installed $dir/meetrs"
+
+    case ":$PATH:" in
+        *":$dir:"*) ;;
+        *) echo; echo "WARNING: $dir is not on your PATH — add it or set MEETRS_BINDIR." ;;
+    esac
+
+    if [ -e "$HOME/.cargo/bin/meetrs" ] && [ "$HOME/.cargo/bin/meetrs" != "$dir/meetrs" ]; then
+        echo
+        echo "NOTE: ~/.cargo/bin/meetrs exists and may shadow this install on PATH."
+        echo "      Remove it if it is stale:  cargo uninstall meetrs"
+    fi
+
 # create this machine's local signing identity so audio consent survives
 # rebuilds (once per machine; see scripts/sign.sh for why)
+[macos]
 signing-cert:
     ./scripts/signing-cert.sh
 

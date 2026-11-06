@@ -13,6 +13,7 @@ mod db;
 mod lock;
 mod model;
 mod r2;
+#[cfg(target_os = "macos")]
 mod tcc;
 mod transcribe;
 mod types;
@@ -108,6 +109,7 @@ fn main() -> Result<()> {
     // prompt and the IOProc silently never runs. Re-exec so meetrs.app is the
     // subject instead. See src/tcc.rs. This replaces the process image, so it
     // has to happen before the lock and before the TUI.
+    #[cfg(target_os = "macos")]
     if args.first().map(String::as_str) != Some("--compress") {
         match tcc::adopt_own_identity()? {
             tcc::Identity::Own => {}
@@ -617,6 +619,7 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
     // The failure this exists to catch: with TCC attributing us to the terminal,
     // the tap is refused and the whole session is silence. Always fatal, and
     // cheap to check — no waiting on audio. See src/tcc.rs.
+    #[cfg(target_os = "macos")]
     if let Some((pid, path)) = tcc::foreign_responsible_process() {
         anyhow::bail!(
             "TCC is attributing this process to {} (pid {}) rather than to meetrs, so \
@@ -793,6 +796,7 @@ fn check() -> Result<()> {
 
 /// Names the application TCC is actually asking about, when that is not meetrs.
 /// Empty when we are our own subject, so it can be appended unconditionally.
+#[cfg(target_os = "macos")]
 fn attribution_note() -> String {
     match tcc::foreign_responsible_process() {
         Some((pid, path)) => format!(
@@ -805,6 +809,12 @@ fn attribution_note() -> String {
         ),
         None => String::new(),
     }
+}
+
+/// No TCC attribution on this platform, so there is never a note to add.
+#[cfg(not(target_os = "macos"))]
+fn attribution_note() -> String {
+    String::new()
 }
 
 #[cfg(test)]

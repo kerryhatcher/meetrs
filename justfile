@@ -141,13 +141,19 @@ upload *DIRS: build
 
 # compress older sessions to FLAC: just compress [session-dir...]
 [macos]
+[positional-arguments]
 compress *DIRS: bundle
-    exec "{{exe}}" --compress {{DIRS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    exec "{{exe}}" --compress "$@"
 
 # compress older sessions to FLAC (Linux): just compress [session-dir...]
 [linux]
+[positional-arguments]
 compress *DIRS: build
-    exec "{{bin}}" --compress {{DIRS}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    exec "{{bin}}" --compress "$@"
 
 # install so `meetrs` works from any directory, recording included
 [macos]

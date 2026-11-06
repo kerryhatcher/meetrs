@@ -70,6 +70,11 @@ objc2-core-audio-types = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-foundation = "0.3.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# PipeWire capture backend (src/capture/linux.rs). Needs libpipewire-0.3 headers
+# and libclang at build time, since pipewire-sys runs bindgen.
+pipewire = "0.10.1"
+
 [profile.release]
 # An unwind across the Core Audio IOProc FFI boundary is not sound. The callback
 # catches panics itself, but abort is the backstop. See docs/research/rust-audio-macos.md

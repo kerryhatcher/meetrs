@@ -31,6 +31,8 @@ use std::path::{Path, PathBuf};
 
 /// Largest magnitude of a 24-bit signed sample: 2^23 - 1.
 const FULL_SCALE_24: f32 = 8_388_607.0;
+/// Bit depth of every FLAC this module writes.
+const FLAC_BITS: u32 = 24;
 /// FLAC's channel limit.
 const MAX_CHANNELS: u16 = 8;
 
@@ -160,7 +162,7 @@ fn compress_one(wav: &Path, flac: &Path) -> Result<u64> {
     drop(samples);
 
     let bytes = encode_flac(&pcm, channels, sample_rate)?;
-    verify_flac(&bytes, &pcm, channels)?;
+    verify_flac(&bytes, &pcm, channels, sample_rate)?;
 
     std::fs::write(flac, &bytes).context("writing FLAC")?;
     Ok(bytes.len() as u64)
@@ -210,7 +212,7 @@ fn encode_flac(pcm: &[i32], channels: u16, sample_rate: u32) -> Result<Vec<u8>> 
     let source = flacenc::source::MemSource::from_samples(
         pcm,
         usize::from(channels),
-        24,
+        FLAC_BITS as usize,
         sample_rate as usize,
     );
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
@@ -222,10 +224,28 @@ fn encode_flac(pcm: &[i32], channels: u16, sample_rate: u32) -> Result<Vec<u8>> 
     Ok(sink.into_inner())
 }
 
-/// Decode `bytes` and require every sample to equal the PCM that was encoded.
-/// A mismatch names the first bad frame so a failure is diagnosable.
-fn verify_flac(bytes: &[u8], pcm: &[i32], channels: u16) -> Result<()> {
+/// Decode `bytes` and require that it describes the same audio that was encoded:
+/// sample rate, channel count and bit depth from STREAMINFO, then every sample
+/// equal to the PCM. A mismatch names the first bad frame so a failure is
+/// diagnosable.
+fn verify_flac(bytes: &[u8], pcm: &[i32], channels: u16, sample_rate: u32) -> Result<()> {
     let mut reader = claxon::FlacReader::new(bytes).context("parsing the encoded FLAC")?;
+    let info = reader.streaminfo();
+    anyhow::ensure!(
+        info.sample_rate == sample_rate,
+        "FLAC is {} Hz, source was {sample_rate} Hz — refusing to delete the WAV",
+        info.sample_rate
+    );
+    anyhow::ensure!(
+        info.channels == u32::from(channels),
+        "FLAC has {} channels, source had {channels} — refusing to delete the WAV",
+        info.channels
+    );
+    anyhow::ensure!(
+        info.bits_per_sample == FLAC_BITS,
+        "FLAC is {} bits per sample, expected {FLAC_BITS} — refusing to delete the WAV",
+        info.bits_per_sample
+    );
     let mut decoded = 0usize;
     for sample in reader.samples() {
         let got = sample.context("decoding the encoded FLAC")?;
@@ -477,6 +497,33 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn verify_refuses_a_stream_with_the_wrong_rate_or_channel_count() {
+        let pcm = vec![0i32; 3 * 100];
+        let bytes = encode_flac(&pcm, 3, 48_000).unwrap();
+        verify_flac(&bytes, &pcm, 3, 48_000).unwrap();
+
+        let err = verify_flac(&bytes, &pcm, 3, 44_100).unwrap_err();
+        assert!(format!("{err:#}").contains("Hz"), "{err:#}");
+        let err = verify_flac(&bytes, &pcm, 2, 48_000).unwrap_err();
+        assert!(format!("{err:#}").contains("channels"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_refuses_a_stream_that_declares_the_wrong_bit_depth() {
+        let pcm = vec![1i32; 3 * 100];
+        let mut bytes = encode_flac(&pcm, 3, 48_000).unwrap();
+        // STREAMINFO starts at byte 8. Sample rate (20 bits), channels-1 (3 bits),
+        // bits-1 (5 bits) and the high bits of the sample count share bytes 18..22.
+        let mut word = u32::from_be_bytes(bytes[18..22].try_into().unwrap());
+        assert_eq!((word >> 4) & 0x1f, FLAC_BITS - 1, "STREAMINFO layout");
+        word = (word & !(0x1f << 4)) | ((16 - 1) << 4);
+        bytes[18..22].copy_from_slice(&word.to_be_bytes());
+
+        let err = verify_flac(&bytes, &pcm, 3, 48_000).unwrap_err();
+        assert!(format!("{err:#}").contains("bits per sample"), "{err:#}");
     }
 
     #[test]

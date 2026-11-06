@@ -44,8 +44,9 @@ sha2 = "0.11.0"
 # external install. The `metal` feature (Apple GPU) is macOS-only; see the
 # target table below.
 whisper-rs = { version = "0.16.0" }
-# native-tls routes through Apple's Security.framework instead of vendoring
-# ring's C and assembly, which fits "Apple frameworks are fine" better.
+# native-tls uses the platform TLS library instead of vendoring ring's C and
+# assembly: Security.framework on macOS, OpenSSL on Linux (so Linux builds need
+# openssl-devel and pkgconf).
 ureq = { version = "3.3.0", default-features = false, features = ["native-tls", "gzip"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"

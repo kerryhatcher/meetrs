@@ -420,6 +420,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Encode a float WAV and decode the FLAC with an independent decoder: every
+    /// sample must match the input within 24-bit quantization, and samples past
+    /// full scale must clamp to +/-(2^23 - 1).
+    #[test]
+    fn flac_round_trip_matches_within_24_bit_quantization() {
+        for channels in [1u16, 2, 4, 8] {
+            let dir = scratch(&format!("roundtrip-{channels}ch"));
+            let wav = dir.join("chunk-000.wav");
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut input = Vec::new();
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..4_000u32 {
+                for ch in 0..channels {
+                    // Mostly in range; frame 0 runs hot high and frame 1 hot low.
+                    let v = match i {
+                        0 => 1.5_f32,
+                        1 => -2.0,
+                        _ => ((i as f32) * 0.01 + f32::from(ch)).sin() * 0.9,
+                    };
+                    w.write_sample(v).unwrap();
+                    input.push(v);
+                }
+            }
+            w.finalize().unwrap();
+
+            let flac = dir.join("chunk-000.flac");
+            let size = compress_one(&wav, &flac).unwrap();
+            assert_eq!(size, std::fs::metadata(&flac).unwrap().len());
+
+            let mut reader = claxon::FlacReader::open(&flac).unwrap();
+            let info = reader.streaminfo();
+            assert_eq!(info.channels, u32::from(channels));
+            assert_eq!(info.bits_per_sample, 24);
+            assert_eq!(info.sample_rate, 48_000);
+            let decoded: Vec<i32> = reader.samples().map(|s| s.unwrap()).collect();
+            assert_eq!(decoded.len(), input.len(), "{channels}ch sample count");
+
+            let tolerance = 1.0 / 8_388_608.0; // 2^-23 of full scale
+            for (i, (&got, &x)) in decoded.iter().zip(&input).enumerate() {
+                let want = f64::from(x.clamp(-1.0, 1.0));
+                let got = f64::from(got) / 8_388_607.0;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{channels}ch sample {i}: input {x}, decoded {got}"
+                );
+            }
+            // The hot samples clamp to exact full scale, not wrap or drop.
+            assert_eq!(decoded[0], 8_388_607);
+            assert_eq!(decoded[usize::from(channels)], -8_388_607);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     #[test]
     fn nothing_to_do_is_not_an_error() {
         let dir = scratch("empty");

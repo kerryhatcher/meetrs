@@ -5,7 +5,7 @@
 //! names a backend directly.
 //!
 //! - macOS: `macos.rs`, Core Audio process tap + aggregate device.
-//! - everything else: `linux.rs`, a stub until the PipeWire backend lands.
+//! - everything else: `linux.rs`, PipeWire (mic + default sink monitor).
 
 #[cfg(target_os = "macos")]
 mod macos;

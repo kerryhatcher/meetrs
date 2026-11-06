@@ -9,6 +9,13 @@ repository = "https://github.com/kerryhatcher/meetrs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+# Pure-Rust FLAC encoder (up to 8 channels, 24-bit). Replaces the macOS-only
+# afconvert shell-out in src/compress.rs. Default features (par, serde, log) are
+# kept; the `decode` feature is not needed because decoding uses claxon.
+flacenc = "0.5.1"
+# Pure-Rust FLAC decoder. Used to verify each encoded chunk decodes to the same
+# frame count before its WAV is deleted.
+claxon = "0.4.3"
 # Deterministic sentence-boundary detection, capitalization, and punctuation
 # restoration for the human-readable transcript. Zero transitive deps, no models,
 # no network. https://github.com/kerryhatcher/crustytts

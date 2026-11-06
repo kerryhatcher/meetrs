@@ -9,6 +9,8 @@ use std::time::Duration;
 /// Every stage runs at this rate. The aggregate device is configured to it and
 /// the WAV headers declare it. If the hardware refuses, capture fails loudly
 /// rather than silently resampling.
+// The macOS backend is the only user today; the Linux stub does not need it yet.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const SAMPLE_RATE: u32 = 48_000;
 
 /// Close the current chunk after this much continuous below-threshold audio.

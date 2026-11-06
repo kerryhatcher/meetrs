@@ -66,6 +66,15 @@ MEETRS_R2_SECRET_ACCESS_KEY. `just run` and `just upload` load them from SOPS.
 const RING_SAMPLES: usize = SAMPLE_RATE_HINT * 4 * 4;
 const SAMPLE_RATE_HINT: usize = 48_000;
 
+/// Context for a failed `capture::start`. The macOS text is the original; the
+/// Linux text points at the PipeWire daemon instead of TCC consent.
+#[cfg(target_os = "macos")]
+const CAPTURE_START_HINT: &str = "starting audio capture — if this is a permissions failure, see the README \
+     section on TCC consent and codesigning";
+#[cfg(not(target_os = "macos"))]
+const CAPTURE_START_HINT: &str = "starting audio capture — if PipeWire is not running, or has no default \
+     sink or source, see the README section on Linux";
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -173,10 +182,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let (info, mut consumer) = capture::start(RING_SAMPLES).context(
-        "starting audio capture — if this is a permissions failure, see the README \
-         section on TCC consent and codesigning",
-    )?;
+    let (info, mut consumer) = capture::start(RING_SAMPLES).context(CAPTURE_START_HINT)?;
 
     // Before the TUI takes the screen, while errors are still readable: confirm
     // this session will actually capture something. Non-destructive, so the

@@ -72,8 +72,9 @@ objc2-foundation = "0.3.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PipeWire capture backend (src/capture/linux.rs). Needs libpipewire-0.3 headers
-# and libclang at build time, since pipewire-sys runs bindgen.
-pipewire = "0.10.1"
+# and libclang at build time, since pipewire-sys runs bindgen. The v0_3_44
+# feature exposes the target.object key used to bind streams to the defaults.
+pipewire = { version = "0.10.1", features = ["v0_3_44"] }
 
 [profile.release]
 # An unwind across the Core Audio IOProc FFI boundary is not sound. The callback

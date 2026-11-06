@@ -533,20 +533,33 @@ fn run_loop(
 }
 
 /// `param_changed` for one leg. Fails startup if PipeWire negotiated anything
-/// other than the 48 kHz, channel-count format we asked for.
+/// other than the 48 kHz, channel-count format we asked for, or if the format
+/// pod cannot be read at all: an unreadable format is not one we can vouch for,
+/// so the stream must not run unchecked.
 fn check_format(startup: &Startup, leg: &mut LegData, id: u32, param: Option<&Pod>) {
     if id != spa::param::ParamType::Format.as_raw() {
         return;
     }
     let Some(param) = param else { return };
-    let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else {
-        return;
+    let (media_type, media_subtype) = match format_utils::parse_format(param) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            startup.fail(format!(
+                "could not read the PipeWire format for the {} leg: {e}",
+                leg.name
+            ));
+            return;
+        }
     };
     if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
         return;
     }
     let mut info = AudioInfoRaw::new();
-    if info.parse(param).is_err() {
+    if let Err(e) = info.parse(param) {
+        startup.fail(format!(
+            "could not read the PipeWire audio format for the {} leg: {e}",
+            leg.name
+        ));
         return;
     }
     if info.rate() != SAMPLE_RATE || info.channels() as usize != leg.channels {
@@ -799,5 +812,37 @@ mod tests {
         );
         assert_eq!(node_name("not json"), None);
         assert_eq!(node_name(r#"{"other":1}"#), None);
+    }
+
+    /// A format pod that cannot be parsed must fail startup, not let the leg run
+    /// unchecked. An all-zero pod is a None pod, not a format object.
+    #[test]
+    fn an_unreadable_format_pod_fails_startup() {
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        let startup = Startup {
+            ready: RefCell::new(Some(tx)),
+            streaming: Cell::new(0),
+        };
+        let (producer, _consumer) = rtrb::RingBuffer::<f32>::new(4);
+        let mut leg = LegData {
+            name: "mic",
+            channels: 1,
+            producer,
+        };
+        let bytes = [0u8; 8];
+        let pod = Pod::from_bytes(&bytes).expect("header-sized pod");
+
+        check_format(
+            &startup,
+            &mut leg,
+            spa::param::ParamType::Format.as_raw(),
+            Some(pod),
+        );
+
+        let msg = rx
+            .try_recv()
+            .expect("startup should have been failed")
+            .expect_err("startup should have been failed");
+        assert!(msg.contains("mic leg"), "{msg}");
     }
 }

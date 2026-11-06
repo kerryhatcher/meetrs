@@ -648,6 +648,51 @@ fn preflight(consumer: &mut rtrb::Consumer<f32>, info: types::CaptureInfo) -> Re
     Ok(())
 }
 
+// Platform wording for the opening checks. The macOS text is the original; the
+// Linux text describes PipeWire (see the capture/linux.rs module docs), which has
+// no consent prompts, no IOProc and no per-app tap.
+
+#[cfg(target_os = "macos")]
+const NO_AUDIO_FIRST_SECOND: &str = "no audio arrived in the first second, so this recording would contain \
+     nothing.\n\
+     The microphone drives capture even with nothing playing, so the audio device \
+     never started or its consent was refused. Run `just check` to see why the \
+     IOProc delivered nothing.";
+#[cfg(not(target_os = "macos"))]
+const NO_AUDIO_FIRST_SECOND: &str = "no audio arrived in the first second, so this recording would contain \
+     nothing.\n\
+     Both streams started, but PipeWire delivered no audio to either of them. Check that \
+     the PipeWire daemon is running and that the default source and sink exist: \
+     `wpctl status` lists both under Audio. Then run `just check`.";
+
+#[cfg(target_os = "macos")]
+const BOTH_LEGS_SILENT: &str = "capture is running but every sample on both legs is bit-exact zero, so this \
+     recording would contain nothing.\n\
+     A real microphone never delivers digital silence: consent was denied, or the \
+     mic is muted. Check System Settings > Privacy & Security > Microphone and \
+     Screen & System Audio Recording, then run `just check` with audio playing.";
+#[cfg(not(target_os = "macos"))]
+const BOTH_LEGS_SILENT: &str = "capture is running but every sample on both legs is bit-exact zero, so this \
+     recording would contain nothing.\n\
+     A live microphone does not produce digital silence, so the likely causes are that \
+     the default source is muted or is not your microphone. Check `wpctl status` for the \
+     default source and its mute state, then run `just check` with audio playing.";
+
+#[cfg(target_os = "macos")]
+const MIC_SILENT_WARNING: &str = "the microphone leg is bit-exact zero while system audio flows — the mic is \
+     muted or its consent was denied. System audio will still be recorded.";
+#[cfg(not(target_os = "macos"))]
+const MIC_SILENT_WARNING: &str = "the microphone leg is bit-exact zero while system audio flows — the default \
+     source is muted or is not your microphone. System audio will still be recorded.";
+
+#[cfg(target_os = "macos")]
+const SYSTEM_SILENT_WARNING: &str = "system audio is bit-exact zero while the mic flows. Expected if nothing is \
+     playing yet; otherwise the tap was refused.";
+#[cfg(not(target_os = "macos"))]
+const SYSTEM_SILENT_WARNING: &str = "system audio is bit-exact zero while the mic flows. Expected if nothing is \
+     playing yet. Otherwise the output you hear is not the default sink, or the default \
+     sink changed after start: meetrs stays bound to the sink that was default at start.";
+
 /// What the opening of the stream means for the session: an error when it would
 /// provably record nothing, a warning when a leg looks wrong, `None` when healthy.
 fn judge(opening: Opening) -> Result<Option<&'static str>> {
@@ -655,39 +700,42 @@ fn judge(opening: Opening) -> Result<Option<&'static str>> {
     // whether or not anything is playing, so an empty first second is never the
     // benign "meeting hasn't started" case. It is a device that never ran.
     if opening.frames == 0 {
-        anyhow::bail!(
-            "no audio arrived in the first second, so this recording would contain \
-             nothing.\n\
-             The microphone drives capture even with nothing playing, so the audio device \
-             never started or its consent was refused. Run `just check` to see why the \
-             IOProc delivered nothing."
-        );
+        anyhow::bail!(NO_AUDIO_FIRST_SECOND);
     }
 
     if !opening.mic_signal && !opening.system_signal {
-        anyhow::bail!(
-            "capture is running but every sample on both legs is bit-exact zero, so this \
-             recording would contain nothing.\n\
-             A real microphone never delivers digital silence: consent was denied, or the \
-             mic is muted. Check System Settings > Privacy & Security > Microphone and \
-             Screen & System Audio Recording, then run `just check` with audio playing."
-        );
+        anyhow::bail!(BOTH_LEGS_SILENT);
     }
 
     Ok(if !opening.mic_signal {
-        Some(
-            "the microphone leg is bit-exact zero while system audio flows — the mic is \
-             muted or its consent was denied. System audio will still be recorded.",
-        )
+        Some(MIC_SILENT_WARNING)
     } else if !opening.system_signal {
-        Some(
-            "system audio is bit-exact zero while the mic flows. Expected if nothing is \
-             playing yet; otherwise the tap was refused.",
-        )
+        Some(SYSTEM_SILENT_WARNING)
     } else {
         None
     })
 }
+
+// Why `--check` got no frames, once it has ruled out "no callbacks at all". The
+// counters mean different things on each backend (see their IoStats docs).
+#[cfg(target_os = "macos")]
+const NO_FRAMES_SHAPE: &str = "every cycle was dropped because the device's buffer count disagreed with \
+     the stream layout discovered at start()";
+#[cfg(not(target_os = "macos"))]
+const NO_FRAMES_SHAPE: &str = "every PipeWire callback was dropped as malformed: no buffer, no data \
+     block, or a byte count that is not a whole number of frames";
+
+#[cfg(target_os = "macos")]
+const NO_FRAMES_EMPTY: &str = "the IOProc ran but every buffer was empty or null";
+#[cfg(not(target_os = "macos"))]
+const NO_FRAMES_EMPTY: &str = "every PipeWire callback delivered zero bytes";
+
+#[cfg(target_os = "macos")]
+const NO_FRAMES_OTHER: &str =
+    "the IOProc ran and produced buffers, but nothing reached the ring buffer";
+#[cfg(not(target_os = "macos"))]
+const NO_FRAMES_OTHER: &str =
+    "PipeWire callbacks ran and delivered data, but nothing reached the output ring";
 
 /// `--check`: capture for a few seconds and report the negotiated layout plus
 /// per-leg signal level, then exit. No TUI, so it runs without a tty.
@@ -740,17 +788,29 @@ fn check() -> Result<()> {
         let why = if io.calls == 0 {
             no_callbacks_hint()
         } else if io.shape_mismatch == io.calls {
-            "every cycle was dropped because the device's buffer count disagreed with \
-             the stream layout discovered at start()"
+            NO_FRAMES_SHAPE
         } else if io.empty == io.calls {
-            "the IOProc ran but every buffer was empty or null"
+            NO_FRAMES_EMPTY
         } else {
-            "the IOProc ran and produced buffers, but nothing reached the ring buffer"
+            NO_FRAMES_OTHER
         };
+        #[cfg(target_os = "macos")]
         anyhow::bail!(
             "no frames arrived at all — capture started but delivered nothing.\n\
              {why}.\n\
              ioproc calls={} shape-mismatch={} empty={} last mNumberBuffers={} (expected {}){}",
+            io.calls,
+            io.shape_mismatch,
+            io.empty,
+            io.last_n_buffers,
+            io.expected_n_buffers,
+            attribution_note(),
+        );
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!(
+            "no frames arrived at all — capture started but delivered nothing.\n\
+             {why}.\n\
+             callbacks={} shape-mismatch={} empty={} last data blocks={} (expected {}){}",
             io.calls,
             io.shape_mismatch,
             io.empty,
@@ -790,7 +850,8 @@ fn check() -> Result<()> {
         println!(
             "\nWARNING: system leg is bit-exact zero across {frames} frames.\n\
              Most likely nothing was playing, which is not a fault: retry with audio \
-             playing. The mic keeps the cycles running while the system leg stays zero.\n\
+             playing. The system leg is the default sink's monitor, which carries silence \
+             while the sink plays nothing.\n\
              If audio *was* playing, the system leg is not bound to the output you are \
              listening to. Capture reads the default sink's monitor, bound once at start, \
              so run `wpctl status` to confirm the default sink is the device in use, and \
@@ -952,5 +1013,52 @@ mod tests {
         let chunk = consumer.read_chunk(9).unwrap();
         chunk.commit_all();
         assert_eq!(consumer.slots(), 0);
+    }
+
+    /// On Linux, none of the user-facing preflight text may name macOS machinery:
+    /// there is no IOProc, no consent prompt and no System Settings pane here.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_preflight_text_names_no_macos_machinery() {
+        const MACOS_TERMS: &[&str] = &[
+            "IOProc",
+            "consent",
+            "System Settings",
+            "mNumberBuffers",
+            "buffer count",
+            "tap",
+            "TCC",
+        ];
+        let silent = |mic, system| Opening {
+            frames: 48_000,
+            mic_signal: mic,
+            system_signal: system,
+        };
+        let mut messages = vec![
+            judge(Opening {
+                frames: 0,
+                mic_signal: false,
+                system_signal: false,
+            })
+            .unwrap_err()
+            .to_string(),
+            judge(silent(false, false)).unwrap_err().to_string(),
+        ];
+        messages.extend(judge(silent(false, true)).unwrap().map(str::to_owned));
+        messages.extend(judge(silent(true, false)).unwrap().map(str::to_owned));
+        messages.extend(
+            [
+                super::NO_FRAMES_SHAPE,
+                super::NO_FRAMES_EMPTY,
+                super::NO_FRAMES_OTHER,
+            ]
+            .map(str::to_owned),
+        );
+
+        for msg in &messages {
+            for term in MACOS_TERMS {
+                assert!(!msg.contains(term), "{term:?} in linux text: {msg}");
+            }
+        }
     }
 }

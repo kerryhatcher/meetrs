@@ -27,6 +27,7 @@
 use anyhow::{Context, Result};
 use flacenc::component::BitRepr;
 use flacenc::error::Verify;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Largest magnitude of a 24-bit signed sample: 2^23 - 1.
@@ -150,22 +151,68 @@ fn wav_chunks(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Encode one WAV to FLAC and verify it before the caller deletes the source.
-/// Returns the FLAC's size on success.
+/// Encode one WAV to FLAC and make the FLAC durable and verified before the
+/// caller deletes the source. Returns the FLAC's size on success.
 ///
-/// The FLAC is verified in memory, before anything is written to disk: it is
-/// decoded back and compared sample-for-sample with the PCM that was encoded.
-/// That check gates deleting the only copy of the audio.
+/// Until this returns Ok, the WAV is the only copy of the audio. The check that
+/// gates deleting it runs on the bytes that are on disk, not on the buffer that
+/// was encoded: see `persist_verified`.
 fn compress_one(wav: &Path, flac: &Path) -> Result<u64> {
     let (channels, sample_rate, samples) = read_float_wav(wav)?;
     let pcm = quantize(&samples);
     drop(samples);
 
     let bytes = encode_flac(&pcm, channels, sample_rate)?;
-    verify_flac(&bytes, &pcm, channels, sample_rate)?;
+    persist_verified(flac, &bytes, &pcm, channels, sample_rate)
+}
 
-    std::fs::write(flac, &bytes).context("writing FLAC")?;
-    Ok(bytes.len() as u64)
+/// The temp file a FLAC is written to before it takes its final name.
+fn temp_path(flac: &Path) -> PathBuf {
+    let mut name = flac.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// Write `bytes` to `flac`, re-read the file from disk, and verify what was read
+/// against `pcm`. Returns the on-disk size. On any failure neither `flac` nor
+/// its temp file is left behind; the WAV is never touched here.
+fn persist_verified(
+    flac: &Path,
+    bytes: &[u8],
+    pcm: &[i32],
+    channels: u16,
+    sample_rate: u32,
+) -> Result<u64> {
+    let outcome = write_durable(flac, bytes).and_then(|()| {
+        let on_disk = std::fs::read(flac).context("re-reading the written FLAC")?;
+        verify_flac(&on_disk, pcm, channels, sample_rate)?;
+        Ok(on_disk.len() as u64)
+    });
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(temp_path(flac));
+        let _ = std::fs::remove_file(flac);
+    }
+    outcome
+}
+
+/// Write to a temp file, fsync it, rename it over the final name, then fsync the
+/// directory. A crash at any point leaves either no FLAC or a complete one.
+fn write_durable(flac: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = temp_path(flac);
+    {
+        let mut file = std::fs::File::create(&tmp).context("creating FLAC temp file")?;
+        file.write_all(bytes).context("writing FLAC temp file")?;
+        file.sync_all().context("syncing FLAC temp file")?;
+    }
+    std::fs::rename(&tmp, flac).context("moving FLAC into place")?;
+    let dir = flac
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .context("syncing the session directory")?;
+    Ok(())
 }
 
 /// Read a float32 WAV as interleaved samples. Anything else is refused: the
@@ -368,8 +415,9 @@ mod tests {
         assert!(!dir.join("chunk-001.wav").exists());
         // Untouched: not a chunk.
         assert!(dir.join("scratch.wav").exists());
-        // No verify temp files left behind.
-        assert!(!dir.join("chunk-000.verify.wav").exists());
+        // No temp files left behind.
+        assert!(!dir.join("chunk-000.flac.tmp").exists());
+        assert!(!dir.join("chunk-001.flac.tmp").exists());
 
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
@@ -497,6 +545,52 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Encode a real chunk's PCM and return what `persist_verified` needs.
+    fn encoded_chunk(dir: &Path) -> (PathBuf, Vec<i32>, Vec<u8>) {
+        let wav = dir.join("chunk-000.wav");
+        write_wav(&wav, 4_800);
+        let (channels, rate, samples) = read_float_wav(&wav).unwrap();
+        let pcm = quantize(&samples);
+        let bytes = encode_flac(&pcm, channels, rate).unwrap();
+        (wav, pcm, bytes)
+    }
+
+    /// The caller's contract: when the FLAC fails verification, the WAV survives
+    /// and neither the final name nor a `.tmp` is left behind.
+    #[test]
+    fn a_flac_that_fails_verification_keeps_the_wav_and_leaves_no_temp_file() {
+        let dir = scratch("corrupt");
+        let (wav, pcm, good) = encoded_chunk(&dir);
+        let flac = dir.join("chunk-000.flac");
+
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xff;
+        let mut truncated = good.clone();
+        truncated.truncate(good.len() - 64);
+
+        for (label, bytes) in [("bit flip", flipped), ("truncated", truncated)] {
+            let err = persist_verified(&flac, &bytes, &pcm, 3, 48_000).expect_err(label);
+            assert!(
+                !flac.exists(),
+                "{label}: corrupt FLAC took its final name: {err:#}"
+            );
+            assert!(
+                !temp_path(&flac).exists(),
+                "{label}: stray .tmp left behind"
+            );
+            assert!(wav.exists(), "{label}: WAV must survive a failed verify");
+        }
+
+        // The same bytes, uncorrupted, do persist and verify.
+        let size = persist_verified(&flac, &good, &pcm, 3, 48_000).unwrap();
+        assert_eq!(size, good.len() as u64);
+        assert!(flac.exists());
+        assert!(!temp_path(&flac).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

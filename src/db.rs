@@ -51,10 +51,33 @@ pub fn open_at(path: &Path) -> Result<Db> {
 }
 
 fn set_pragmas(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    // busy_timeout first: switching to WAL takes a lock, and without a timeout
+    // already in place a second connection opening the same file fails at once
+    // with SQLITE_BUSY instead of waiting.
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    set_wal(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(())
+}
+
+/// Switch to WAL, retrying while another connection holds the file. SQLite does
+/// not always apply `busy_timeout` to a journal-mode change, so a second opener
+/// can get SQLITE_BUSY straight away. Retry until the same deadline a statement
+/// would have had.
+fn set_wal(conn: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {

@@ -5,7 +5,7 @@
 //! SDK: it is one request shape, and the dependencies it would bring are far
 //! larger than the code. HMAC is built from `sha2`, which is already here.
 //!
-//! Credentials come from the environment and never from `config.yaml`, so a
+//! Credentials come from the environment and never from `config.toml`, so a
 //! secret is not sitting in plaintext in the file a user might paste into a bug
 //! report.
 

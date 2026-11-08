@@ -273,7 +273,7 @@ setting can live in the config file below as `silence_rms`.
 
 ## Configuration
 
-meetrs reads `~/.meetrs/config.yaml`. The first run creates it with every key
+meetrs reads `~/.meetrs/config.toml`. The first run creates it with every key
 commented out, so the built-in defaults apply until you uncomment one. meetrs
 never rewrites the file after that, so your edits survive upgrades. An unknown
 key or a malformed value stops startup and names the file and the problem.
@@ -295,15 +295,17 @@ runs when recording stops, after transcription and compression. Uploads run on
 their own thread and never delay recording. It is off by default. To turn it on, set `upload.r2` in the
 config file:
 
-```yaml
-upload:
-  r2:
-    enabled: true
-    account_id: <your Cloudflare account id>
-    bucket: hatcher-meetrs
-    prefix: meetings/        # optional; keys become meetings/<session>/<file>
-    interval_secs: 300       # optional; how often changed files are sent (min 30)
+```toml
+[upload.r2]
+enabled = true
+account_id = "<your Cloudflare account id>"
+bucket = "hatcher-meetrs"
+prefix = "meetings/"         # optional; keys become meetings/<session>/<file>
+interval_secs = 300          # optional; how often changed files are sent (min 30)
 ```
+
+Earlier builds read `config.yaml`. That file is no longer read, and meetrs prints
+a note at startup if it finds one without a `config.toml` next to it.
 
 The access key stays out of the file. It goes in the environment, and `just run`
 injects it from a SOPS-encrypted env file, `~/secrets/meetrs.env` by default

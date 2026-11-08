@@ -52,7 +52,7 @@ usage:
   meetrs -V, --version          show the version
 
 files:
-  ~/.meetrs/config.yaml         settings, created on first run
+  ~/.meetrs/config.toml         settings, created on first run
   ~/.meetrs/recordings/         one directory per session
   ~/.meetrs/meetrs.db           search index (derived, rebuildable)
 
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
         _ => {}
     }
 
-    // So ~/.meetrs/config.yaml exists from the first run on, and so a malformed
+    // So ~/.meetrs/config.toml exists from the first run on, and so a malformed
     // file is reported before any setting is read. Subcommands below go through
     // here too, including --search, which is cheap and harmless.
     config::init()?;

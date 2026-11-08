@@ -15,11 +15,11 @@ pub const SAMPLE_RATE: u32 = 48_000;
 /// A natural conversational pause, not an inter-word gap.
 pub const SILENCE_TO_CUT: Duration = Duration::from_secs(2);
 
-/// Default for `max_chunk_secs` in config.yaml. Force a cut after this much
+/// Default for `max_chunk_secs` in config.toml. Force a cut after this much
 /// continuous speech, so a monologue still bounds crash loss.
 pub const DEFAULT_MAX_CHUNK: Duration = Duration::from_secs(150);
 
-/// Default for `max_chunk_bytes` in config.yaml. The largest a chunk's WAV may
+/// Default for `max_chunk_bytes` in config.toml. The largest a chunk's WAV may
 /// grow. The writer cuts before passing it, so the chunk and the FLAC made from
 /// it stay under 99 MB, and the uploader will not send a larger file. The planned
 /// upload backend rejects anything bigger.
@@ -60,7 +60,7 @@ pub const SILENCE_RMS_ENV: &str = "MEETRS_SILENCE_RMS";
 
 /// RMS-fallback silence threshold (see `DEFAULT_SILENCE_RMS`; normal chunking
 /// uses the VAD and does not read this). Precedence: `MEETRS_SILENCE_RMS`, then
-/// `silence_rms` in `~/.meetrs/config.yaml`, then `DEFAULT_SILENCE_RMS`. A malformed env value is
+/// `silence_rms` in `~/.meetrs/config.toml`, then `DEFAULT_SILENCE_RMS`. A malformed env value is
 /// ignored rather than fatal, since a typo in an env var should not stop a
 /// recording that is about to start. The config file is validated at startup,
 /// so a bad value there never gets this far.

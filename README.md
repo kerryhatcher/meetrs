@@ -55,14 +55,25 @@ Build dependencies (Fedora package names):
 
 ```sh
 sudo dnf install clang clang-devel cmake gcc gcc-c++ pkgconf-pkg-config \
-  openssl-devel pipewire-devel vulkan-headers vulkan-loader-devel glslc
+  openssl-devel pipewire-devel
 ```
 
 - `clang`, `clang-devel`: `bindgen` generates the PipeWire and whisper.cpp bindings.
 - `cmake`, `gcc`, `gcc-c++`: whisper.cpp is compiled from source.
 - `pkgconf-pkg-config`, `pipewire-devel`: PipeWire is found through pkg-config.
 - `openssl-devel`: TLS (for the model download) goes through OpenSSL.
-- `vulkan-headers`, `vulkan-loader-devel`, `glslc`: the Vulkan backend for whisper.cpp.
+GPU backends are optional. Without one, whisper.cpp runs on the CPU and nothing
+GPU-related is needed to build.
+
+- Vulkan (any Vulkan GPU, tested on AMD): `sudo dnf install vulkan-headers
+  vulkan-loader-devel glslc`.
+- CUDA (NVIDIA): the CUDA toolkit is not in Fedora's repositories. Add NVIDIA's
+  Fedora repository and install the compiler and libraries:
+
+  ```sh
+  sudo dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
+  sudo dnf install cuda-nvcc-13-5 cuda-cudart-devel-13-5 libcublas-devel-13-5
+  ```
 
 On an immutable image such as Bluefin the host filesystem is read-only, so do the
 build inside a distrobox or toolbox.
@@ -71,14 +82,30 @@ Runtime dependencies:
 
 - PipeWire. Startup fails with an error if no default sink or source appears
   within 5 seconds.
-- A Vulkan loader (`vulkan-loader`) and a driver, such as `mesa-vulkan-drivers`
-  for AMD. If Vulkan cannot start, transcription runs on the CPU instead (see
-  below for the measured cost).
+- For Vulkan: a Vulkan loader (`vulkan-loader`) and a driver, such as
+  `mesa-vulkan-drivers` for AMD. If Vulkan cannot start, transcription runs on
+  the CPU instead (see below for the measured cost).
+- For CUDA: the NVIDIA driver (tested with 615.78.08).
 
 Install and run:
 
+Pick the GPU backend at build time. A binary built without a backend always runs
+on the CPU:
+
 ```sh
-cargo build --release
+just run                          # CPU only
+MEETRS_FEATURES=vulkan just run   # Vulkan GPU (AMD, Intel, NVIDIA)
+MEETRS_FEATURES=cuda just run     # NVIDIA GPU via CUDA
+```
+
+Changing `MEETRS_FEATURES` rebuilds the binary, since the build records which
+features it was compiled with.
+
+Without `just`, the same builds are plain cargo feature flags:
+
+```sh
+cargo build --release                      # CPU only
+cargo build --release --features cuda      # or --features vulkan
 ./target/release/meetrs
 ```
 

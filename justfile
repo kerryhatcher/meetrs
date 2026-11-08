@@ -17,15 +17,24 @@ installed_exe := installed + "/Contents/MacOS/meetrs"
 default:
     @just --list
 
-# build the release binary; skipped when no source or Cargo file is newer than it
+# GPU backend compiled into the binary: MEETRS_FEATURES=vulkan, =cuda, or unset for CPU.
+gpu_features := env("MEETRS_FEATURES", "")
+
+# build the release binary; skipped when nothing changed and the GPU features match
 build:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -x "{{bin}}" ] && [ -z "$(find src Cargo.toml Cargo.lock -newer "{{bin}}" -print -quit)" ]; then
-        echo "up to date: {{bin}}"
+    stamp="{{bin}}.features"
+    want="{{gpu_features}}"
+    have=$(cat "$stamp" 2>/dev/null || true)
+    if [ -x "{{bin}}" ] && [ "$have" = "$want" ] && [ -z "$(find src Cargo.toml Cargo.lock -newer "{{bin}}" -print -quit)" ]; then
+        echo "up to date: {{bin}} (features: ${want:-cpu})"
         exit 0
     fi
-    cargo build --release
+    args=()
+    if [ -n "$want" ]; then args=(--features "$want"); fi
+    cargo build --release "${args[@]}"
+    printf '%s' "$want" > "$stamp"
 
 # rebuild the .app only when missing or the binary is newer than what's bundled
 [macos]

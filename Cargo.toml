@@ -76,22 +76,27 @@ objc2-foundation = "0.3.2"
 # and libclang at build time, since pipewire-sys runs bindgen. The v0_3_44
 # feature exposes the target.object key used to bind streams to the defaults.
 pipewire = { version = "0.10.1", features = ["v0_3_44"] }
-# Vulkan GPU backend for whisper.cpp, chosen over CPU on the reference box
-# (Ryzen 7 6800U, Radeon 680M, 76 s clip, small.en-tdrz, median of 9 passes):
-#   CPU (15 threads):  RTF 0.41, ~442 CPU-seconds per pass
-#   Vulkan (RADV):     RTF 0.34, ~13 CPU-seconds per pass
-#   OpenBLAS (CPU):    RTF 0.60 (slower than plain CPU, so not used)
-# Vulkan is ~17% faster in wall time, and it moves nearly all the work off the
-# CPU. That matters because chunks are transcribed while capture and the TUI
-# keep running on the same cores. Transcripts differ by a few words between
-# backends (see the commit body); both are equally imperfect.
+
+# GPU backends for whisper.cpp. Both are opt-in, so a plain build needs no GPU
+# SDK and always works, on the CPU if nothing else is asked for.
 #
-# Build needs vulkan-headers, vulkan-loader-devel and glslc (Fedora package
-# names; shaderc provides glslc on other distros). Runtime needs a Vulkan
-# loader plus an ICD such as mesa-vulkan-drivers. Without a working ICD,
-# whisper.cpp logs "no GPU found" and transcribes on the CPU, so the feature
-# degrades rather than fails.
-whisper-rs = { version = "0.16.0", features = ["vulkan"] }
+#   vulkan: any Vulkan-capable GPU (AMD, Intel, NVIDIA). Chosen over CPU on the
+#     reference box (Ryzen 7 6800U, Radeon 680M, 76 s clip, small.en-tdrz, median
+#     of 9 passes): CPU (15 threads) RTF 0.41 at ~442 CPU-seconds per pass; Vulkan
+#     (RADV) RTF 0.34 at ~13 CPU-seconds per pass, so it also leaves the CPU free
+#     for capture and the TUI. Build needs vulkan-headers, vulkan-loader-devel and
+#     glslc (shaderc on other distros). Runtime needs a Vulkan loader and an ICD
+#     such as mesa-vulkan-drivers. Without a working ICD, whisper.cpp logs "no GPU
+#     found" and transcribes on the CPU.
+#   cuda: NVIDIA only. Build needs the CUDA toolkit (nvcc, cudart and cuBLAS dev
+#     packages); run needs the NVIDIA driver.
+#
+#   cargo build --release --features vulkan
+#   cargo build --release --features cuda
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
 
 [profile.release]
 # An unwind across the Core Audio IOProc FFI boundary is not sound. The callback

@@ -9,6 +9,13 @@ repository = "https://github.com/kerryhatcher/meetrs"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+# Pure-Rust FLAC encoder (up to 8 channels, 24-bit). Replaces the macOS-only
+# afconvert shell-out in src/compress.rs. Default features (par, serde, log) are
+# kept; the `decode` feature is not needed because decoding uses claxon.
+flacenc = "0.5.1"
+# Pure-Rust FLAC decoder. Used to verify each encoded chunk decodes to the same
+# frame count before its WAV is deleted.
+claxon = "0.4.3"
 # Deterministic sentence-boundary detection, capitalization, and punctuation
 # restoration for the human-readable transcript. Zero transitive deps, no models,
 # no network. https://github.com/kerryhatcher/crustytts
@@ -34,22 +41,26 @@ rubato = "4.0.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 sha2 = "0.11.0"
 # whisper.cpp, compiled from vendored source into this binary. No dylib, no
-# external install. `metal` pulls in Apple's Metal + Accelerate frameworks.
-whisper-rs = { version = "0.16.0", features = ["metal"] }
-# native-tls routes through Apple's Security.framework instead of vendoring
-# ring's C and assembly, which fits "Apple frameworks are fine" better.
+# external install. The `metal` feature (Apple GPU) is macOS-only; see the
+# target table below.
+whisper-rs = { version = "0.16.0" }
+# native-tls uses the platform TLS library instead of vendoring ring's C and
+# assembly: Security.framework on macOS, OpenSSL on Linux (so Linux builds need
+# openssl-devel and pkgconf).
 ureq = { version = "3.3.0", default-features = false, features = ["native-tls", "gzip"] }
 ratatui = "0.30.2"
 crossterm = "0.29.0"
 rtrb = "0.3.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
-# YAML for ~/.meetrs/config.yaml. serde_yaml itself is archived; this is its
-# maintained fork with the same API.
-serde_yaml_ng = "0.10.0"
+# TOML for ~/.meetrs/config.toml.
+toml = "1.2.1"
 
-# ponytail: macOS-only POC, so these are unconditional rather than cfg-gated.
-# Add [target.'cfg(target_os = "macos")'.dependencies] when a second platform lands.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Metal GPU backend for whisper.cpp. Cargo unifies this with the base
+# whisper-rs entry above, so on macOS the crate is built with `metal`.
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+# Core Audio process tap + aggregate device capture (src/capture/macos.rs).
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2 = "0.6.4"
@@ -58,6 +69,33 @@ objc2-core-audio = "0.3.2"
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-foundation = "0.3.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# PipeWire capture backend (src/capture/linux.rs). Needs libpipewire-0.3 headers
+# and libclang at build time, since pipewire-sys runs bindgen. The v0_3_44
+# feature exposes the target.object key used to bind streams to the defaults.
+pipewire = { version = "0.10.1", features = ["v0_3_44"] }
+
+# GPU backends for whisper.cpp. Both are opt-in, so a plain build needs no GPU
+# SDK and always works, on the CPU if nothing else is asked for.
+#
+#   vulkan: any Vulkan-capable GPU (AMD, Intel, NVIDIA). Chosen over CPU on the
+#     reference box (Ryzen 7 6800U, Radeon 680M, 76 s clip, small.en-tdrz, median
+#     of 9 passes): CPU (15 threads) RTF 0.41 at ~442 CPU-seconds per pass; Vulkan
+#     (RADV) RTF 0.34 at ~13 CPU-seconds per pass, so it also leaves the CPU free
+#     for capture and the TUI. Build needs vulkan-headers, vulkan-loader-devel and
+#     glslc (shaderc on other distros). Runtime needs a Vulkan loader and an ICD
+#     such as mesa-vulkan-drivers. Without a working ICD, whisper.cpp logs "no GPU
+#     found" and transcribes on the CPU.
+#   cuda: NVIDIA only. Build needs the CUDA toolkit (nvcc, cudart and cuBLAS dev
+#     packages); run needs the NVIDIA driver.
+#
+#   cargo build --release --features vulkan
+#   cargo build --release --features cuda
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
 
 [profile.release]
 # An unwind across the Core Audio IOProc FFI boundary is not sound. The callback

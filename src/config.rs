@@ -1,10 +1,9 @@
-//! User configuration at `~/.meetrs/config.yaml`.
+//! User configuration at `~/.meetrs/config.toml`.
 //!
-//! Created with commented-out defaults on first run and never overwritten after
-//! that, so a user's edits survive upgrades. Every key is optional: an unset key
-//! falls back to the compiled-in default in `types`. Environment variables still
-//! win over the file, so `MEETRS_SILENCE_RMS=0.03 meetrs` works without editing
-//! anything.
+//! Created with commented-out defaults on first run. A user's own edits are
+//! never overwritten. Every key is optional: an unset key falls back to the
+//! compiled-in default in `types`. Environment variables still win over the
+//! file, so `MEETRS_SILENCE_RMS=0.03 meetrs` works without editing anything.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -75,7 +74,7 @@ const MAX_CHUNK_SECS_BLOCK: &str = "\
 # How long a recording chunk may run, in seconds of continuous speech, before it
 # is closed. A chunk also closes after 2 seconds of silence, so this only limits
 # unbroken speech. Minimum 10.
-max_chunk_secs: 150
+max_chunk_secs = 150
 ";
 
 /// The chunk-size key, as written to a new file or added to an existing one.
@@ -83,55 +82,54 @@ const MAX_CHUNK_BYTES_BLOCK: &str = "\
 # The largest a chunk's WAV may grow, in bytes. A chunk is closed before it would
 # pass this. Uploads also refuse any file over it. 99 MB keeps files under the
 # planned backend's limit. Minimum 10000000.
-max_chunk_bytes: 99000000
+max_chunk_bytes = 99000000
 ";
 
-/// What gets written on first run. Everything is commented out, so the file
-/// parses to `Config::default()` and the compiled-in values stay in effect until
-/// the user opts in to a key.
+/// What gets written on first run. The chunk limits are live keys so their
+/// defaults are visible. Everything else is commented out, so the built-in
+/// values stay in effect until the user opts in.
 const TEMPLATE: &str = "\
 # meetrs configuration.
 #
-# Created on first run. Edit freely; meetrs reads it at startup and never
-# rewrites it. Environment variables such as MEETRS_SILENCE_RMS override these
-# values. A commented-out key falls back to its built-in default. The chunk limits
-# below are written in full, so their defaults are visible.
+# Created on first run. Edit freely. meetrs reads it at startup and only adds the
+# two chunk-limit keys below when they are missing. Environment variables such as
+# MEETRS_SILENCE_RMS override these values. A commented-out key falls back to its
+# built-in default.
 
 # How long a recording chunk may run, in seconds of continuous speech, before it
 # is closed. A chunk also closes after 2 seconds of silence, so this only limits
 # unbroken speech. Minimum 10.
-max_chunk_secs: 150
+max_chunk_secs = 150
 
 # The largest a chunk's WAV may grow, in bytes. A chunk is closed before it would
 # pass this. Uploads also refuse any file over it. 99 MB keeps files under the
 # planned backend's limit. Minimum 10000000.
-max_chunk_bytes: 99000000
+max_chunk_bytes = 99000000
 
 # Below this RMS (linear, not dB) a block counts as silence. This only applies
 # when the voice-activity detector fails to load and meetrs falls back to a
 # plain volume threshold. Normal operation ignores it.
-# silence_rms: 0.02
+# silence_rms = 0.02
 
 # Upload recordings to a Cloudflare R2 bucket. Every interval_secs, whatever
 # changed is sent, and a final pass runs when recording stops. Keys look like
 # <prefix><session>/<file>. The access key goes in the environment, never in
 # this file:
 #   MEETRS_R2_ACCESS_KEY_ID, MEETRS_R2_SECRET_ACCESS_KEY
-# upload:
-#   r2:
-#     enabled: false
-#     account_id: <your Cloudflare account id>
-#     bucket: <bucket name>
-#     prefix: ''
-#     interval_secs: 300
+# [upload.r2]
+# enabled = false
+# account_id = \"<your Cloudflare account id>\"
+# bucket = \"<bucket name>\"
+# prefix = \"\"
+# interval_secs = 300
 ";
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
 
-/// `~/.meetrs/config.yaml`.
+/// `~/.meetrs/config.toml`.
 pub fn path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set; cannot locate ~/.meetrs")?;
-    Ok(PathBuf::from(home).join(".meetrs").join("config.yaml"))
+    Ok(PathBuf::from(home).join(".meetrs").join("config.toml"))
 }
 
 /// Load the config for this process, creating the file first if it is missing.
@@ -139,7 +137,17 @@ pub fn path() -> Result<PathBuf> {
 /// error rather than a silent fallback: the user wrote it and should hear about a
 /// typo before a recording runs on the wrong threshold.
 pub fn init() -> Result<()> {
-    let cfg = load_or_create(&path()?)?;
+    let path = path()?;
+    if !path.exists() {
+        // The file used to be config.yaml. It is no longer read, so say so
+        // instead of silently ignoring the user's settings.
+        if path.with_file_name("config.yaml").exists() {
+            eprintln!(
+                "meetrs: note: ~/.meetrs/config.yaml is no longer read; move its settings to config.toml"
+            );
+        }
+    }
+    let cfg = load_or_create(&path)?;
     // A second call is a no-op; the first load wins for the process lifetime.
     let _ = CONFIG.set(cfg);
     Ok(())
@@ -167,13 +175,11 @@ fn load_or_create(path: &Path) -> Result<Config> {
 }
 
 /// Add the chunk-limit keys the file does not define, at their defaults, so the
-/// user can see the options and what they are set to. Only these keys are ever
-/// appended, and only at the end of the file. The new text is parsed before
-/// anything is written, so a file that would not load is left untouched.
+/// user can see the options and what they are set to. The keys go at the top
+/// level, before the first `[table]` header, because TOML would otherwise file
+/// them under that table. The edited text is parsed before anything is written,
+/// so a file that would not load is left untouched.
 fn add_missing_keys(path: &Path, text: &str, cfg: Config) -> Result<Config> {
-    // Looked up in the text, not the parsed value: a key that is present but empty
-    // (`max_chunk_secs:`) parses to None, and appending it again would make the
-    // file fail to load.
     let mut add = String::new();
     if !defines_key(text, "max_chunk_secs") {
         add.push_str(MAX_CHUNK_SECS_BLOCK);
@@ -188,37 +194,65 @@ fn add_missing_keys(path: &Path, text: &str, cfg: Config) -> Result<Config> {
         return Ok(cfg);
     }
 
-    let gap = if text.is_empty() || text.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    let combined = format!("{text}{gap}\n{add}");
-    // A file that is not a plain mapping (a flow mapping, say) cannot take appended
-    // lines. Leave it alone and run on the defaults, rather than refuse to start.
+    let combined = insert_top_level(text, &add);
     let Ok(updated) = parse(&combined, path) else {
         eprintln!(
-            "meetrs: warning: {} is not a plain YAML mapping, so chunk settings were not added",
+            "meetrs: warning: could not add chunk settings to {}: the file would not parse after the edit",
             path.display()
         );
         return Ok(cfg);
     };
 
-    let written = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .and_then(|mut file| file.write_all(format!("{gap}\n{add}").as_bytes()));
-    match written {
+    match write_atomic(path, &combined) {
         Ok(()) => Ok(updated),
         // Read-only or in use: meetrs still runs, with the same values in effect.
         Err(e) => {
             eprintln!(
-                "meetrs: warning: could not add chunk settings to {}: {e}",
+                "meetrs: warning: could not add chunk settings to {}: {e:#}",
                 path.display()
             );
             Ok(updated)
         }
     }
+}
+
+/// Insert top-level key lines before the first `[table]` header, or at the end
+/// when there is none, so they stay top-level. Lines that begin with `#` are
+/// comments and are never headers.
+fn insert_top_level(text: &str, add: &str) -> String {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            return format!("{}{add}\n{}", &text[..offset], &text[offset..]);
+        }
+        offset += line.len();
+    }
+    let mut out = text.to_owned();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(add);
+    out
+}
+
+/// Replace `path` with `contents` through a temp file in the same directory, so
+/// a crash mid-write cannot leave a half-written config behind.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut file =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 /// Write the template with `create_new`, so an existing file (including one that
@@ -240,18 +274,14 @@ fn create_template(path: &Path) -> Result<()> {
 
 /// Whether the document has a top-level key `key`, whatever its value.
 fn defines_key(text: &str, key: &str) -> bool {
-    serde_yaml_ng::from_str::<Option<serde_yaml_ng::Mapping>>(text)
-        .ok()
-        .flatten()
-        .is_some_and(|m| m.keys().any(|k| k.as_str() == Some(key)))
+    text.parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key(key))
 }
 
 fn parse(text: &str, path: &Path) -> Result<Config> {
-    // `Option` so a file with only comments (an empty YAML document) is valid and
-    // means "all defaults", rather than an error about a missing mapping.
-    let cfg = serde_yaml_ng::from_str::<Option<Config>>(text)
-        .with_context(|| format!("parsing {}", path.display()))?
-        .unwrap_or_default();
+    // An empty file, or one with only comments, is valid and means all defaults.
+    let cfg: Config =
+        toml::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
     if let Some(secs) = cfg.max_chunk_secs {
         anyhow::ensure!(
             secs.is_finite() && (MIN_MAX_CHUNK_SECS..=MAX_MAX_CHUNK_SECS).contains(&secs),
@@ -314,7 +344,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meetrs-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("config.yaml")
+        dir.join("config.toml")
     }
 
     #[test]
@@ -328,11 +358,11 @@ mod tests {
     #[test]
     fn existing_file_keeps_its_own_text_and_gains_only_the_chunk_keys() {
         let path = scratch("keep");
-        std::fs::write(&path, "silence_rms: 0.05\n").unwrap();
+        std::fs::write(&path, "silence_rms = 0.05\n").unwrap();
         let cfg = load_or_create(&path).expect("load");
         assert_eq!(cfg.silence_rms, Some(0.05));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("silence_rms: 0.05\n"), "{text}");
+        assert!(text.starts_with("silence_rms = 0.05\n"), "{text}");
         assert!(text.contains(MAX_CHUNK_SECS_BLOCK));
         assert!(text.contains(MAX_CHUNK_BYTES_BLOCK));
     }
@@ -340,13 +370,13 @@ mod tests {
     #[test]
     fn missing_chunk_keys_are_added_with_their_defaults() {
         let path = scratch("add");
-        std::fs::write(&path, "silence_rms: 0.03").unwrap(); // no trailing newline
+        std::fs::write(&path, "silence_rms = 0.03").unwrap(); // no trailing newline
         let cfg = load_or_create(&path).expect("load");
         assert_eq!(cfg.max_chunk_secs, Some(150.0));
         assert_eq!(cfg.max_chunk_bytes, Some(99_000_000));
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("max_chunk_secs: 150"), "{text}");
-        assert!(text.contains("max_chunk_bytes: 99000000"), "{text}");
+        assert!(text.contains("max_chunk_secs = 150"), "{text}");
+        assert!(text.contains("max_chunk_bytes = 99000000"), "{text}");
         // Second load: nothing left to add, so the file does not change.
         let before = text.clone();
         load_or_create(&path).expect("reload");
@@ -354,9 +384,30 @@ mod tests {
     }
 
     #[test]
+    fn chunk_keys_go_above_a_table_so_they_stay_top_level() {
+        let path = scratch("table");
+        let text = "silence_rms = 0.04\n\n[upload.r2]\nenabled = false\n";
+        std::fs::write(&path, text).unwrap();
+        let cfg = load_or_create(&path).expect("load");
+        assert_eq!(cfg.max_chunk_secs, Some(150.0));
+        assert_eq!(cfg.max_chunk_bytes, Some(99_000_000));
+        let written = std::fs::read_to_string(&path).unwrap();
+        let header = written.find("[upload.r2]").unwrap();
+        assert!(
+            written.find("max_chunk_secs = 150").unwrap() < header,
+            "{written}"
+        );
+        assert!(
+            written.find("max_chunk_bytes = 99000000").unwrap() < header,
+            "{written}"
+        );
+        assert!(written.contains("enabled = false"));
+    }
+
+    #[test]
     fn a_defined_chunk_key_is_left_alone() {
         let path = scratch("defined");
-        let text = "max_chunk_secs: 60\nmax_chunk_bytes: 50000000\n";
+        let text = "max_chunk_secs = 60\nmax_chunk_bytes = 50000000\n";
         std::fs::write(&path, text).unwrap();
         let cfg = load_or_create(&path).expect("load");
         assert_eq!(cfg.max_chunk_secs, Some(60.0));
@@ -372,12 +423,12 @@ mod tests {
 
     #[test]
     fn chunk_limits_below_the_minimum_are_rejected() {
-        assert!(parse("max_chunk_secs: 5\n", Path::new("x")).is_err());
-        assert!(parse("max_chunk_secs: .inf\n", Path::new("x")).is_err());
-        assert!(parse("max_chunk_bytes: 1000\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_secs = 5\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_secs = inf\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_bytes = 1000\n", Path::new("x")).is_err());
         assert!(
             parse(
-                "max_chunk_secs: 10\nmax_chunk_bytes: 10000000\n",
+                "max_chunk_secs = 10\nmax_chunk_bytes = 10000000\n",
                 Path::new("x")
             )
             .is_ok()
@@ -388,6 +439,7 @@ mod tests {
     fn template_itself_parses_to_defaults() {
         let cfg = parse(TEMPLATE, Path::new("template")).expect("template must parse");
         assert!(cfg.silence_rms.is_none());
+        assert_eq!(cfg.max_chunk_secs, Some(150.0));
     }
 
     #[test]
@@ -398,20 +450,20 @@ mod tests {
 
     #[test]
     fn silence_rms_is_read() {
-        let cfg = parse("silence_rms: 0.035\n", Path::new("x")).unwrap();
+        let cfg = parse("silence_rms = 0.035\n", Path::new("x")).unwrap();
         assert_eq!(cfg.silence_rms, Some(0.035));
     }
 
     #[test]
     fn unknown_key_is_an_error_so_typos_surface() {
-        let err = parse("silence_rmss: 0.03\n", Path::new("x")).unwrap_err();
+        let err = parse("silence_rmss = 0.03\n", Path::new("x")).unwrap_err();
         assert!(format!("{err:#}").contains("silence_rmss"), "{err:#}");
     }
 
     #[test]
     fn non_positive_or_non_finite_threshold_is_rejected() {
-        for bad in ["0", "-0.1", ".nan", ".inf"] {
-            let text = format!("silence_rms: {bad}\n");
+        for bad in ["0", "-0.1", "nan", "inf"] {
+            let text = format!("silence_rms = {bad}\n");
             assert!(
                 parse(&text, Path::new("x")).is_err(),
                 "{bad} should be rejected"
@@ -421,22 +473,22 @@ mod tests {
 
     #[test]
     fn upload_is_off_and_unchecked_by_default() {
-        let cfg = parse("upload:\n  r2:\n    bucket: NOT VALID\n", Path::new("x")).unwrap();
+        let cfg = parse("[upload.r2]\nbucket = \"NOT VALID\"\n", Path::new("x")).unwrap();
         assert!(!cfg.upload.r2.enabled);
     }
 
     #[test]
     fn enabled_upload_needs_account_and_bucket() {
-        let no_account = "upload:\n  r2:\n    enabled: true\n    bucket: hatcher-meetrs\n";
+        let no_account = "[upload.r2]\nenabled = true\nbucket = \"hatcher-meetrs\"\n";
         assert!(parse(no_account, Path::new("x")).is_err());
         let no_bucket =
-            "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n";
+            "[upload.r2]\nenabled = true\naccount_id = \"0123456789abcdef0123456789abcdef\"\n";
         assert!(parse(no_bucket, Path::new("x")).is_err());
     }
 
     #[test]
     fn enabled_upload_with_full_settings_parses() {
-        let text = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: hatcher-meetrs\n    prefix: meetings/\n";
+        let text = "[upload.r2]\nenabled = true\naccount_id = \"0123456789abcdef0123456789abcdef\"\nbucket = \"hatcher-meetrs\"\nprefix = \"meetings/\"\n";
         let cfg = parse(text, Path::new("x")).unwrap();
         assert!(cfg.upload.r2.enabled);
         assert_eq!(cfg.upload.r2.bucket.as_deref(), Some("hatcher-meetrs"));
@@ -445,55 +497,51 @@ mod tests {
 
     #[test]
     fn enabled_upload_rejects_a_bad_bucket_name() {
-        let text = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: Bad_Name\n";
+        let text = "[upload.r2]\nenabled = true\naccount_id = \"0123456789abcdef0123456789abcdef\"\nbucket = \"Bad_Name\"\n";
         assert!(parse(text, Path::new("x")).is_err());
     }
 
     #[test]
     fn upload_interval_defaults_to_five_minutes_and_has_a_floor() {
-        let on = "upload:\n  r2:\n    enabled: true\n    account_id: 0123456789abcdef0123456789abcdef\n    bucket: hatcher-meetrs\n";
+        let on = "[upload.r2]\nenabled = true\naccount_id = \"0123456789abcdef0123456789abcdef\"\nbucket = \"hatcher-meetrs\"\n";
         assert_eq!(
             parse(on, Path::new("x")).unwrap().upload.r2.interval_secs,
             300
         );
-        let too_fast = format!("{on}    interval_secs: 5\n");
+        let too_fast = format!("{on}interval_secs = 5\n");
         assert!(parse(&too_fast, Path::new("x")).is_err());
     }
 
     #[test]
-    fn an_empty_chunk_key_is_not_appended_a_second_time() {
-        // `max_chunk_secs:` with no value is present, so it must not be added again.
-        let path = scratch("empty-key");
-        std::fs::write(&path, "max_chunk_secs:\nmax_chunk_bytes: 50000000\n").unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-        load_or_create(&path).expect("an empty key must not break the file");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-    }
-
-    #[test]
-    fn a_flow_mapping_file_still_starts_and_is_left_alone() {
-        let path = scratch("flow");
-        let text = "{silence_rms: 0.03}\n";
+    fn malformed_file_is_an_error_and_is_left_untouched() {
+        let path = scratch("malformed");
+        let text = "max_chunk_secs =\n";
         std::fs::write(&path, text).unwrap();
-        let cfg = load_or_create(&path).expect("must still start");
-        assert_eq!(cfg.silence_rms, Some(0.03));
+        assert!(load_or_create(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 
     #[test]
+    fn an_inline_table_at_the_top_level_is_rejected() {
+        // TOML has no top-level flow mapping, so this is malformed, not a file to edit.
+        assert!(parse("{silence_rms = 0.03}\n", Path::new("x")).is_err());
+    }
+
+    #[test]
     fn chunk_secs_above_a_day_is_rejected() {
-        assert!(parse("max_chunk_secs: 1e300\n", Path::new("x")).is_err());
-        assert!(parse("max_chunk_secs: 86400\n", Path::new("x")).is_ok());
+        assert!(parse("max_chunk_secs = 1e300\n", Path::new("x")).is_err());
+        assert!(parse("max_chunk_secs = 86400\n", Path::new("x")).is_ok());
     }
 
     #[test]
     fn account_id_must_be_32_hex_digits() {
-        let bad = "upload:\n  r2:\n    enabled: true\n    account_id: abc/def\n    bucket: hatcher-meetrs\n";
+        let bad =
+            "[upload.r2]\nenabled = true\naccount_id = \"abc/def\"\nbucket = \"hatcher-meetrs\"\n";
         assert!(parse(bad, Path::new("x")).is_err());
     }
 
     #[test]
-    fn malformed_yaml_is_an_error() {
-        assert!(parse("silence_rms: [0.1\n", Path::new("x")).is_err());
+    fn malformed_toml_is_an_error() {
+        assert!(parse("silence_rms = [0.1\n", Path::new("x")).is_err());
     }
 }

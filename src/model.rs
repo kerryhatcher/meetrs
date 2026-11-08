@@ -87,8 +87,9 @@ pub fn ensure(mut progress: impl FnMut(u64, u64)) -> Result<PathBuf> {
 fn download(url: &str, dest_tmp: &Path, progress: &mut impl FnMut(u64, u64)) -> Result<()> {
     // ureq 3 defaults its TLS *provider* to Rustls even when only the
     // `native-tls` feature is enabled, and then panics at request time. Select
-    // the provider explicitly so TLS goes through Apple's Security.framework
-    // rather than a vendored crypto stack.
+    // the provider explicitly so TLS goes through the platform library that
+    // native-tls wraps (Security.framework on macOS, OpenSSL on Linux) rather
+    // than Rustls.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(
             ureq::tls::TlsConfig::builder()

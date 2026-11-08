@@ -7,10 +7,12 @@ costs at most one chunk.
 Transcription runs locally as recording proceeds — the first chunk starts
 transcribing while the second is still being recorded. Nothing leaves the machine.
 
-**Status: proof of concept.** macOS only. It does not delete or groom anything,
-so it will happily fill your disk.
+**Status: proof of concept.** macOS and Linux (PipeWire). It does not delete or
+groom anything, so it will happily fill your disk.
 
 ## Install
+
+### macOS
 
 macOS 14.4+ (that floor is a Core Audio process-tap requirement, not arbitrary —
 see `docs/research/rust-audio-macos.md`, kept in git history rather than the
@@ -21,21 +23,6 @@ cargo build --release
 ./scripts/bundle.sh release
 ./target/release/meetrs.app/Contents/MacOS/meetrs
 ```
-
-First run downloads the transcription model (`ggml-small.en-tdrz.bin`, 465 MiB)
-to `~/.meetrs/models/`. It is the tinydiarize fine-tune of `small.en` — the only
-published Whisper model that marks speaker turns, which is why it is unquantized
-and eight times the size of a plain `base.en`. A speaker turn shows up in a
-transcript as a `T` number after the leg, e.g. `system/T3`: tinydiarize flags
-where the speaker changed between two segments, so segments sharing a number
-are believed to be the same speaker and a higher number is a different speaker
-from the one before it (more on exactly what that does and doesn't claim below,
-under `transcript.md`). Set `MEETRS_MODEL` to use a model you already have;
-transcripts then simply carry no `T` numbers.
-
-Upgrading from an earlier version leaves the superseded `ggml-base.en-q5_1.bin`
-in that directory. meetrs grooms nothing, so delete it yourself if you want the
-57 MiB back.
 
 The `.app` wrapper is not optional. macOS gates audio capture behind TCC consent,
 consent requires the `NSAudioCaptureUsageDescription` and
@@ -59,10 +46,140 @@ On first run, macOS will ask for microphone and system-audio-recording consent.
 Grant both, then **fully quit and relaunch** — a screen/audio-recording grant does
 not apply to an already-running process.
 
+### Linux
+
+Tested on Fedora (Bluefin) with PipeWire 1.6 and pipewire-pulse running, and an
+AMD GPU using the RADV Vulkan driver. Other setups have not been tested.
+
+Build dependencies (Fedora package names):
+
+```sh
+sudo dnf install clang clang-devel cmake gcc gcc-c++ pkgconf-pkg-config \
+  openssl-devel pipewire-devel
+```
+
+- `clang`, `clang-devel`: `bindgen` generates the PipeWire and whisper.cpp bindings.
+- `cmake`, `gcc`, `gcc-c++`: whisper.cpp is compiled from source.
+- `pkgconf-pkg-config`, `pipewire-devel`: PipeWire is found through pkg-config.
+- `openssl-devel`: TLS (for the model download) goes through OpenSSL.
+GPU backends are optional. Without one, whisper.cpp runs on the CPU and nothing
+GPU-related is needed to build.
+
+- Vulkan (any Vulkan GPU, tested on AMD): `sudo dnf install vulkan-headers
+  vulkan-loader-devel glslc`.
+- CUDA (NVIDIA): the CUDA toolkit is not in Fedora's repositories. Add NVIDIA's
+  Fedora repository and install the compiler and libraries:
+
+  ```sh
+  sudo dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo
+  sudo dnf install cuda-nvcc-13-5 cuda-cudart-devel-13-5 libcublas-devel-13-5
+  ```
+
+On an immutable image such as Bluefin the host filesystem is read-only, so do the
+build inside a distrobox or toolbox.
+
+Runtime dependencies:
+
+- PipeWire. Startup fails with an error if no default sink or source appears
+  within 5 seconds.
+- For Vulkan: a Vulkan loader (`vulkan-loader`) and a driver, such as
+  `mesa-vulkan-drivers` for AMD. If Vulkan cannot start, transcription runs on
+  the CPU instead (see below for the measured cost).
+- For CUDA: the NVIDIA driver (tested with 615.78.08).
+
+Install and run:
+
+Pick the GPU backend at build time. A binary built without a backend always runs
+on the CPU:
+
+```sh
+just run                          # CPU only
+MEETRS_FEATURES=vulkan just run   # Vulkan GPU (AMD, Intel, NVIDIA)
+MEETRS_FEATURES=cuda just run     # NVIDIA GPU via CUDA
+```
+
+Changing `MEETRS_FEATURES` rebuilds the binary, since the build records which
+features it was compiled with.
+
+Without `just`, the same builds are plain cargo feature flags:
+
+```sh
+cargo build --release                      # CPU only
+cargo build --release --features cuda      # or --features vulkan
+./target/release/meetrs
+```
+
+The binary is just `target/release/meetrs`. There is no `.app` bundle and no TCC
+or consent step on Linux. `just build`, `just run` and `just install` work too:
+`just run` injects the R2 credentials from SOPS as on macOS, and `just install`
+copies the binary to `~/.local/bin` (set `MEETRS_BINDIR` to change that).
+
+Finished sessions are compressed to FLAC in-process, so no external encoder is
+needed.
+
+#### Linux limitations
+
+- **Weaker clock sync than macOS.** macOS runs both legs from one Core Audio
+  IOProc, so the device keeps them sample-accurate. Here the mic and system legs
+  are separate PipeWire streams, aligned only by the PipeWire graph clock. Pairing
+  is by arrival order, so the legs can sit a few milliseconds apart, and that
+  offset can vary.
+- **Stalls and drift show up as silence.** A leg that runs more than 50 ms ahead
+  of the other is buffered. Past that, the lagging leg is zero-filled for the whole
+  backlog, so a stall or steady drift becomes a gap of up to about 50 ms on that
+  leg. Samples are not lost or reordered.
+- **A stream that dies after start is silent, with no notice.** Stream errors are
+  only reported during startup. After that, that leg simply stops producing audio.
+- **Default-device changes are not followed.** The streams stay on the sink and
+  source that were default when meetrs started. Restart meetrs to pick up a new
+  default.
+- **Fixed format.** Both streams are requested as 48 kHz F32LE, and PipeWire's
+  adapter converts from the device's own format.
+- **Speakers leak into the mic.** The system leg is the default sink's monitor and
+  the mic is the default source. Without headphones, the mic also picks up the
+  playback, so the same speech can appear on both legs and be transcribed twice.
+  Use headphones.
+
+#### Transcription backend on Linux
+
+Measured on one machine (Ryzen 7 6800U, Radeon 680M, RADV), with the `small.en-tdrz`
+model on a 76 s clip: median of 9 passes, 15 threads as the worker uses.
+
+| Backend | Wall time | RTF | CPU-seconds per pass |
+|---|---|---|---|
+| CPU | 31.1 s | 0.41 | 442 |
+| Vulkan (RADV) | 26.2 s | 0.34 | 13 |
+
+Vulkan is faster in wall time and uses about 34 times less CPU per pass. That
+matters because transcription shares cores with capture and the TUI. Transcripts
+differ by a few words between backends (the CPU run renders "Priya" as "Preer", the
+Vulkan run drops the name), and each backend gives the same output run to run.
+
+If no Vulkan driver is available (`VK_ICD_FILENAMES=/nonexistent` simulates this),
+whisper.cpp logs `no GPU found` and transcribes on the CPU. In that run the RTF was
+0.44, and the run still succeeded.
+
+## Transcription model
+
+First run downloads the transcription model (`ggml-small.en-tdrz.bin`, 465 MiB)
+to `~/.meetrs/models/`. It is the tinydiarize fine-tune of `small.en` — the only
+published Whisper model that marks speaker turns, which is why it is unquantized
+and eight times the size of a plain `base.en`. A speaker turn shows up in a
+transcript as a `T` number after the leg, e.g. `system/T3`: tinydiarize flags
+where the speaker changed between two segments, so segments sharing a number
+are believed to be the same speaker and a higher number is a different speaker
+from the one before it (more on exactly what that does and doesn't claim below,
+under `transcript.md`). Set `MEETRS_MODEL` to use a model you already have;
+transcripts then simply carry no `T` numbers.
+
+Upgrading from an earlier version leaves the superseded `ggml-base.en-q5_1.bin`
+in that directory. meetrs grooms nothing, so delete it yourself if you want the
+57 MiB back.
+
 ## Use
 
 ```sh
-just run                          # build, bundle if needed, launch the TUI
+just run                          # build (and bundle, on macOS), launch the TUI
 just check                        # headless: channel layout and per-leg levels
 just search "budget OR headcount" # full-text search every transcript
 just --list                       # everything else
@@ -156,7 +273,7 @@ setting can live in the config file below as `silence_rms`.
 
 ## Configuration
 
-meetrs reads `~/.meetrs/config.yaml`. The first run creates it with every key
+meetrs reads `~/.meetrs/config.toml`. The first run creates it with every key
 commented out, so the built-in defaults apply until you uncomment one. meetrs
 never rewrites the file after that, so your edits survive upgrades. An unknown
 key or a malformed value stops startup and names the file and the problem.
@@ -178,15 +295,17 @@ runs when recording stops, after transcription and compression. Uploads run on
 their own thread and never delay recording. It is off by default. To turn it on, set `upload.r2` in the
 config file:
 
-```yaml
-upload:
-  r2:
-    enabled: true
-    account_id: <your Cloudflare account id>
-    bucket: hatcher-meetrs
-    prefix: meetings/        # optional; keys become meetings/<session>/<file>
-    interval_secs: 300       # optional; how often changed files are sent (min 30)
+```toml
+[upload.r2]
+enabled = true
+account_id = "<your Cloudflare account id>"
+bucket = "hatcher-meetrs"
+prefix = "meetings/"         # optional; keys become meetings/<session>/<file>
+interval_secs = 300          # optional; how often changed files are sent (min 30)
 ```
+
+Earlier builds read `config.yaml`. That file is no longer read, and meetrs prints
+a note at startup if it finds one without a `config.toml` next to it.
 
 The access key stays out of the file. It goes in the environment, and `just run`
 injects it from a SOPS-encrypted env file, `~/secrets/meetrs.env` by default
@@ -227,12 +346,13 @@ thresholds live in [`src/types.rs`](src/types.rs).
 | File | Role |
 |---|---|
 | `src/types.rs` | Shared contracts and tuning constants |
-| `src/capture.rs` | Core Audio process tap + mic in one aggregate device, one IOProc |
+| `src/capture/macos.rs` | Core Audio process tap + mic in one aggregate device, one IOProc |
+| `src/capture/linux.rs` | PipeWire: mic and default-sink monitor as two streams |
 | `src/chunk.rs` | Silence state machine, WAV writing, `meta.json` |
 | `src/ui.rs` | Ratatui level meters and chunk list |
 | `src/db.rs` | SQLite state + FTS5 index (derived, rebuildable) |
 
-Capture builds a single aggregate device containing both a global process tap and
+On macOS, capture builds a single aggregate device containing both a global process tap and
 the default input device, with drift compensation on both legs, and installs one
 IOProc on it. One IOProc means Core Audio does the clock sync — the alternative,
 two independent streams reconciled by timestamp, means owning drift correction
@@ -240,8 +360,9 @@ yourself.
 
 ## Known limitations
 
-- **macOS only.** The PipeWire plan is in `docs/research/rust-audio-linux.md`,
-  in git history (`git show 3212d62:docs/research/rust-audio-linux.md`).
+- **macOS was not recompiled in the Linux port.** The macOS code is gated by
+  `cfg`, and the Linux changes were built and tested on Linux only. Linux
+  limitations are listed under [Linux](#linux-limitations).
 - **No grooming.** Nothing is ever deleted. This will fill your disk.
 - **Continuous system audio suppresses chunk splits.** A chunk stays open while
   either leg has speech, so background music or a playing video holds one chunk

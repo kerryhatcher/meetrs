@@ -6,25 +6,36 @@
 //! has yet to be transcribed. Doing this per-chunk inside the transcribe thread
 //! would mean two threads rewriting `meta.json`.
 //!
-//! FLAC via `afconvert(1)`, which ships with macOS — no new dependency, no
-//! bundled encoder. It is the only royalty-free codec the built-in tooling can
-//! actually write here: `afconvert` refuses Opus and Vorbis for our channel
-//! counts (verified 1-4ch, all fail with 'fmt?'), while FLAC works for all of
-//! them.
+//! FLAC is encoded in-process with `flacenc`, a pure-Rust encoder, so the same
+//! code runs on Linux and macOS with no external tool and no C dependency. Each
+//! chunk is decoded back with `claxon` (also pure Rust) and compared
+//! sample-for-sample against the PCM that went in; the WAV is only removed after
+//! that check passes. Channel counts 1-8 are supported (FLAC's limit).
 //!
 //! The SQLite index is deliberately not updated: `chunks.file` is written but
 //! never read back by any query, and `--reindex` recomputes it from the
 //! `meta.json` this module rewrites. Adding an UPDATE here would buy nothing.
 //!
-//! Lossless with one documented exception: `afconvert` encodes our float32
-//! source as 24-bit FLAC, so samples outside +/-1.0 clamp to full scale. Those
+//! Lossless with one documented exception: the float32 source is encoded as
+//! 24-bit FLAC. Each sample is clamped to [-1.0, 1.0] and scaled to +/-8388607
+//! (2^23 - 1), so anything outside the range clips to full scale and everything
+//! inside is quantized to 24 bits (error at most 1/2^23 of full scale). Those
 //! samples are already clipped as far as every consumer is concerned (Whisper,
 //! playback, any int format), but a mic running that hot loses information here
 //! that it would keep in the float WAV.
 
 use anyhow::{Context, Result};
+use flacenc::component::BitRepr;
+use flacenc::error::Verify;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+/// Largest magnitude of a 24-bit signed sample: 2^23 - 1.
+const FULL_SCALE_24: f32 = 8_388_607.0;
+/// Bit depth of every FLAC this module writes.
+const FLAC_BITS: u32 = 24;
+/// FLAC's channel limit.
+const MAX_CHANNELS: u16 = 8;
 
 /// What a session's compression pass did, for the closing summary.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -140,74 +151,171 @@ fn wav_chunks(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Encode one WAV to FLAC and verify it before the caller deletes the source.
-/// Returns the FLAC's size on success.
+/// Encode one WAV to FLAC and make the FLAC durable and verified before the
+/// caller deletes the source. Returns the FLAC's size on success.
+///
+/// Until this returns Ok, the WAV is the only copy of the audio. The check that
+/// gates deleting it runs on the bytes that are on disk, not on the buffer that
+/// was encoded: see `persist_verified`.
 fn compress_one(wav: &Path, flac: &Path) -> Result<u64> {
-    let expected = wav_frames(wav).context("reading source frame count")?;
+    let (channels, sample_rate, samples) = read_float_wav(wav)?;
+    let pcm = quantize(&samples);
+    drop(samples);
 
-    // `-f flac` selects the FLAC file type; `-d flac` its only data format.
-    // Passing a PCM data format here fails with 'fmt?'.
-    let out = Command::new("/usr/bin/afconvert")
-        .arg("-f")
-        .arg("flac")
-        .arg("-d")
-        .arg("flac")
-        .arg(wav)
-        .arg(flac)
-        .output()
-        .context("running afconvert")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "afconvert failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-
-    // Verify by decoding back and counting frames rather than trusting the exit
-    // status — this is the check that gates deleting the only copy of the audio.
-    // Costs one temp file the size of the original, for a few milliseconds.
-    // Deliberately outside the session dir: anything named `chunk-*.wav` in
-    // there is a compression candidate, so a probe file left by a crash would
-    // come back as input on the next run.
-    let probe = std::env::temp_dir().join(format!(
-        "meetrs-verify-{}-{}.wav",
-        std::process::id(),
-        flac.file_stem().unwrap_or_default().to_string_lossy()
-    ));
-    let decoded = decode_frames(flac, &probe);
-    let _ = std::fs::remove_file(&probe);
-    let decoded = decoded.context("decoding the FLAC back to verify it")?;
-    anyhow::ensure!(
-        decoded == expected,
-        "FLAC has {decoded} frames, source had {expected} — refusing to delete the WAV"
-    );
-
-    Ok(std::fs::metadata(flac)?.len())
+    let bytes = encode_flac(&pcm, channels, sample_rate)?;
+    persist_verified(flac, &bytes, &pcm, channels, sample_rate)
 }
 
-fn decode_frames(flac: &Path, probe: &Path) -> Result<u64> {
-    let out = Command::new("/usr/bin/afconvert")
-        .arg("-f")
-        .arg("WAVE")
-        .arg("-d")
-        .arg("LEF32")
-        .arg(flac)
-        .arg(probe)
-        .output()
-        .context("running afconvert to decode")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "afconvert decode failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    wav_frames(probe)
+/// The temp file a FLAC is written to before it takes its final name.
+fn temp_path(flac: &Path) -> PathBuf {
+    let mut name = flac.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
 }
 
-fn wav_frames(path: &Path) -> Result<u64> {
-    let reader =
+/// Write `bytes` to `flac`, re-read the file from disk, and verify what was read
+/// against `pcm`. Returns the on-disk size. On any failure neither `flac` nor
+/// its temp file is left behind; the WAV is never touched here.
+fn persist_verified(
+    flac: &Path,
+    bytes: &[u8],
+    pcm: &[i32],
+    channels: u16,
+    sample_rate: u32,
+) -> Result<u64> {
+    let outcome = write_durable(flac, bytes).and_then(|()| {
+        let on_disk = std::fs::read(flac).context("re-reading the written FLAC")?;
+        verify_flac(&on_disk, pcm, channels, sample_rate)?;
+        Ok(on_disk.len() as u64)
+    });
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(temp_path(flac));
+        let _ = std::fs::remove_file(flac);
+    }
+    outcome
+}
+
+/// Write to a temp file, fsync it, rename it over the final name, then fsync the
+/// directory. A crash at any point leaves either no FLAC or a complete one.
+fn write_durable(flac: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = temp_path(flac);
+    {
+        let mut file = std::fs::File::create(&tmp).context("creating FLAC temp file")?;
+        file.write_all(bytes).context("writing FLAC temp file")?;
+        file.sync_all().context("syncing FLAC temp file")?;
+    }
+    std::fs::rename(&tmp, flac).context("moving FLAC into place")?;
+    let dir = flac
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .context("syncing the session directory")?;
+    Ok(())
+}
+
+/// Read a float32 WAV as interleaved samples. Anything else is refused: the
+/// recorder only ever writes float32, and a different layout here would mean
+/// the quantization step below is wrong.
+fn read_float_wav(path: &Path) -> Result<(u16, u32, Vec<f32>)> {
+    let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
-    Ok(reader.duration() as u64)
+    let spec = reader.spec();
+    anyhow::ensure!(
+        spec.sample_format == hound::SampleFormat::Float && spec.bits_per_sample == 32,
+        "expected float32 WAV, found {}-bit {:?}",
+        spec.bits_per_sample,
+        spec.sample_format
+    );
+    anyhow::ensure!(
+        (1..=MAX_CHANNELS).contains(&spec.channels),
+        "{} channels, FLAC supports 1-{MAX_CHANNELS}",
+        spec.channels
+    );
+    let samples = reader
+        .samples::<f32>()
+        .collect::<Result<Vec<f32>, _>>()
+        .context("reading samples")?;
+    Ok((spec.channels, spec.sample_rate, samples))
+}
+
+/// Float -> 24-bit signed PCM. This is the one lossy step: NaN and out-of-range
+/// samples are clamped to [-1.0, 1.0] (NaN becomes 0), then scaled and rounded.
+fn quantize(samples: &[f32]) -> Vec<i32> {
+    samples
+        .iter()
+        .map(|&s| (s.clamp(-1.0, 1.0) * FULL_SCALE_24).round() as i32)
+        .collect()
+}
+
+/// Encode interleaved 24-bit PCM as a FLAC stream, in memory.
+fn encode_flac(pcm: &[i32], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
+    // flacenc's error types are not Send + Sync, so they are rendered to text
+    // rather than wrapped with `.context`.
+    let config = flacenc::config::Encoder::default()
+        .into_verified()
+        .map_err(|(_, e)| anyhow::anyhow!("building FLAC encoder config: {e}"))?;
+    let source = flacenc::source::MemSource::from_samples(
+        pcm,
+        usize::from(channels),
+        FLAC_BITS as usize,
+        sample_rate as usize,
+    );
+    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|e| anyhow::anyhow!("encoding FLAC: {e}"))?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| anyhow::anyhow!("serializing FLAC: {e}"))?;
+    Ok(sink.into_inner())
+}
+
+/// Decode `bytes` and require that it describes the same audio that was encoded:
+/// sample rate, channel count and bit depth from STREAMINFO, then every sample
+/// equal to the PCM. A mismatch names the first bad frame so a failure is
+/// diagnosable.
+fn verify_flac(bytes: &[u8], pcm: &[i32], channels: u16, sample_rate: u32) -> Result<()> {
+    let mut reader = claxon::FlacReader::new(bytes).context("parsing the encoded FLAC")?;
+    let info = reader.streaminfo();
+    anyhow::ensure!(
+        info.sample_rate == sample_rate,
+        "FLAC is {} Hz, source was {sample_rate} Hz — refusing to delete the WAV",
+        info.sample_rate
+    );
+    anyhow::ensure!(
+        info.channels == u32::from(channels),
+        "FLAC has {} channels, source had {channels} — refusing to delete the WAV",
+        info.channels
+    );
+    anyhow::ensure!(
+        info.bits_per_sample == FLAC_BITS,
+        "FLAC is {} bits per sample, expected {FLAC_BITS} — refusing to delete the WAV",
+        info.bits_per_sample
+    );
+    let mut decoded = 0usize;
+    for sample in reader.samples() {
+        let got = sample.context("decoding the encoded FLAC")?;
+        let want = *pcm.get(decoded).with_context(|| {
+            format!(
+                "FLAC has more samples than the source's {} — refusing to delete the WAV",
+                pcm.len()
+            )
+        })?;
+        anyhow::ensure!(
+            want == got,
+            "FLAC sample {decoded} decodes to {got}, source had {want} — refusing to delete the WAV"
+        );
+        decoded += 1;
+    }
+    let channels = usize::from(channels);
+    anyhow::ensure!(
+        decoded == pcm.len(),
+        "FLAC has {} frames, source had {} — refusing to delete the WAV",
+        decoded / channels,
+        pcm.len() / channels
+    );
+    Ok(())
 }
 
 /// Rewrite `meta.json`'s `chunks[].file` values for the files we renamed.
@@ -307,8 +415,9 @@ mod tests {
         assert!(!dir.join("chunk-001.wav").exists());
         // Untouched: not a chunk.
         assert!(dir.join("scratch.wav").exists());
-        // No verify temp files left behind.
-        assert!(!dir.join("chunk-000.verify.wav").exists());
+        // No temp files left behind.
+        assert!(!dir.join("chunk-000.flac.tmp").exists());
+        assert!(!dir.join("chunk-001.flac.tmp").exists());
 
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
@@ -364,7 +473,7 @@ mod tests {
     #[test]
     fn an_unencodable_file_keeps_its_wav_and_warns() {
         let dir = scratch("bad");
-        // Not audio at all: afconvert must fail and the file must survive.
+        // Not audio at all: the WAV reader must fail and the file must survive.
         std::fs::write(dir.join("chunk-000.wav"), b"definitely not a wav").unwrap();
         std::fs::write(dir.join("chunk-000.json"), b"{}").unwrap();
 
@@ -377,6 +486,138 @@ mod tests {
         assert!(!dir.join("chunk-000.flac").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Encode a float WAV and decode the FLAC with an independent decoder: every
+    /// sample must match the input within 24-bit quantization, and samples past
+    /// full scale must clamp to +/-(2^23 - 1).
+    #[test]
+    fn flac_round_trip_matches_within_24_bit_quantization() {
+        for channels in [1u16, 2, 4, 8] {
+            let dir = scratch(&format!("roundtrip-{channels}ch"));
+            let wav = dir.join("chunk-000.wav");
+            let spec = hound::WavSpec {
+                channels,
+                sample_rate: 48_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut input = Vec::new();
+            let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+            for i in 0..4_000u32 {
+                for ch in 0..channels {
+                    // Mostly in range; frame 0 runs hot high and frame 1 hot low.
+                    let v = match i {
+                        0 => 1.5_f32,
+                        1 => -2.0,
+                        _ => ((i as f32) * 0.01 + f32::from(ch)).sin() * 0.9,
+                    };
+                    w.write_sample(v).unwrap();
+                    input.push(v);
+                }
+            }
+            w.finalize().unwrap();
+
+            let flac = dir.join("chunk-000.flac");
+            let size = compress_one(&wav, &flac).unwrap();
+            assert_eq!(size, std::fs::metadata(&flac).unwrap().len());
+
+            let mut reader = claxon::FlacReader::open(&flac).unwrap();
+            let info = reader.streaminfo();
+            assert_eq!(info.channels, u32::from(channels));
+            assert_eq!(info.bits_per_sample, 24);
+            assert_eq!(info.sample_rate, 48_000);
+            let decoded: Vec<i32> = reader.samples().map(|s| s.unwrap()).collect();
+            assert_eq!(decoded.len(), input.len(), "{channels}ch sample count");
+
+            let tolerance = 1.0 / 8_388_608.0; // 2^-23 of full scale
+            for (i, (&got, &x)) in decoded.iter().zip(&input).enumerate() {
+                let want = f64::from(x.clamp(-1.0, 1.0));
+                let got = f64::from(got) / 8_388_607.0;
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{channels}ch sample {i}: input {x}, decoded {got}"
+                );
+            }
+            // The hot samples clamp to exact full scale, not wrap or drop.
+            assert_eq!(decoded[0], 8_388_607);
+            assert_eq!(decoded[usize::from(channels)], -8_388_607);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Encode a real chunk's PCM and return what `persist_verified` needs.
+    fn encoded_chunk(dir: &Path) -> (PathBuf, Vec<i32>, Vec<u8>) {
+        let wav = dir.join("chunk-000.wav");
+        write_wav(&wav, 4_800);
+        let (channels, rate, samples) = read_float_wav(&wav).unwrap();
+        let pcm = quantize(&samples);
+        let bytes = encode_flac(&pcm, channels, rate).unwrap();
+        (wav, pcm, bytes)
+    }
+
+    /// The caller's contract: when the FLAC fails verification, the WAV survives
+    /// and neither the final name nor a `.tmp` is left behind.
+    #[test]
+    fn a_flac_that_fails_verification_keeps_the_wav_and_leaves_no_temp_file() {
+        let dir = scratch("corrupt");
+        let (wav, pcm, good) = encoded_chunk(&dir);
+        let flac = dir.join("chunk-000.flac");
+
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xff;
+        let mut truncated = good.clone();
+        truncated.truncate(good.len() - 64);
+
+        for (label, bytes) in [("bit flip", flipped), ("truncated", truncated)] {
+            let err = persist_verified(&flac, &bytes, &pcm, 3, 48_000).expect_err(label);
+            assert!(
+                !flac.exists(),
+                "{label}: corrupt FLAC took its final name: {err:#}"
+            );
+            assert!(
+                !temp_path(&flac).exists(),
+                "{label}: stray .tmp left behind"
+            );
+            assert!(wav.exists(), "{label}: WAV must survive a failed verify");
+        }
+
+        // The same bytes, uncorrupted, do persist and verify.
+        let size = persist_verified(&flac, &good, &pcm, 3, 48_000).unwrap();
+        assert_eq!(size, good.len() as u64);
+        assert!(flac.exists());
+        assert!(!temp_path(&flac).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_refuses_a_stream_with_the_wrong_rate_or_channel_count() {
+        let pcm = vec![0i32; 3 * 100];
+        let bytes = encode_flac(&pcm, 3, 48_000).unwrap();
+        verify_flac(&bytes, &pcm, 3, 48_000).unwrap();
+
+        let err = verify_flac(&bytes, &pcm, 3, 44_100).unwrap_err();
+        assert!(format!("{err:#}").contains("Hz"), "{err:#}");
+        let err = verify_flac(&bytes, &pcm, 2, 48_000).unwrap_err();
+        assert!(format!("{err:#}").contains("channels"), "{err:#}");
+    }
+
+    #[test]
+    fn verify_refuses_a_stream_that_declares_the_wrong_bit_depth() {
+        let pcm = vec![1i32; 3 * 100];
+        let mut bytes = encode_flac(&pcm, 3, 48_000).unwrap();
+        // STREAMINFO starts at byte 8. Sample rate (20 bits), channels-1 (3 bits),
+        // bits-1 (5 bits) and the high bits of the sample count share bytes 18..22.
+        let mut word = u32::from_be_bytes(bytes[18..22].try_into().unwrap());
+        assert_eq!((word >> 4) & 0x1f, FLAC_BITS - 1, "STREAMINFO layout");
+        word = (word & !(0x1f << 4)) | ((16 - 1) << 4);
+        bytes[18..22].copy_from_slice(&word.to_be_bytes());
+
+        let err = verify_flac(&bytes, &pcm, 3, 48_000).unwrap_err();
+        assert!(format!("{err:#}").contains("bits per sample"), "{err:#}");
     }
 
     #[test]

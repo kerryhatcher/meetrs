@@ -84,6 +84,11 @@ static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static SHAPE_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static EMPTY_CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static LAST_N_DATAS: AtomicU64 = AtomicU64::new(0);
+/// Process callbacks from the system stream alone. A sink that is suspended, or
+/// not running, delivers none, which is different from delivering silence.
+static SYS_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Timer ticks to wait before deciding the system stream never delivered audio.
+const SYS_SILENCE_CHECK_TICKS: u32 = (STARTUP_TIMEOUT.as_millis() / MIXER_TICK.as_millis()) as u32;
 /// The first failure a stream reports after startup, such as the device being
 /// unplugged. Startup failures fail `start()` instead. The other leg keeps
 /// recording, so the writer takes this once through `take_stream_fault` and
@@ -312,6 +317,12 @@ fn node_name(value: &str) -> Option<String> {
     v.get("name")?.as_str().map(str::to_owned)
 }
 
+/// True on the one tick that ends the wait for the system stream, if it has
+/// delivered nothing by then.
+fn sink_never_delivered(tick: u32, sys_callbacks: u64) -> bool {
+    tick == SYS_SILENCE_CHECK_TICKS && sys_callbacks == 0
+}
+
 /// The F32LE format request for one leg. Rate and channel count are fixed, so
 /// PipeWire's adapter converts whatever the device runs at.
 fn format_param(channels: u32) -> Result<Vec<u8>> {
@@ -337,6 +348,9 @@ fn format_param(channels: u32) -> Result<Vec<u8>> {
 /// as dropped if the ring is full.
 fn on_process(stream: &Stream, leg: &mut LegData) {
     CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    if leg.name == "system" {
+        SYS_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
     let Some(mut buffer) = stream.dequeue_buffer() else {
         SHAPE_MISMATCH.fetch_add(1, Ordering::Relaxed);
         return;
@@ -549,10 +563,20 @@ fn run_loop(
 
     // --- phase 3: pair the legs on a timer, quit on request --------------------
     let mixer = RefCell::new(Mixer::new(mic_cons, sys_cons, out, LEG_TOLERANCE_FRAMES));
+    let ticks = Cell::new(0u32);
     let timer = mainloop.loop_().add_timer(move |_| {
         let overrun = mixer.borrow_mut().tick();
         if overrun > 0 {
             DROPPED_SAMPLES.fetch_add(overrun, Ordering::Relaxed);
+        }
+        let n = ticks.get().saturating_add(1);
+        ticks.set(n);
+        if sink_never_delivered(n, SYS_CALLBACKS.load(Ordering::Relaxed)) {
+            record_fault(
+                "system",
+                "PipeWire delivered no audio to it in the first 5 seconds; \
+                 the default output may be suspended or not running",
+            );
         }
     });
     let _ = timer.update_timer(Some(MIXER_TICK), Some(MIXER_TICK));
@@ -853,6 +877,15 @@ mod tests {
         assert!(msg.starts_with("system stream stopped"), "{msg}");
         assert!(msg.contains("device gone"), "{msg}");
         assert!(take_stream_fault().is_none(), "reported twice");
+    }
+
+    #[test]
+    fn a_system_stream_with_no_callbacks_is_reported_once_at_the_deadline() {
+        assert!(!sink_never_delivered(SYS_SILENCE_CHECK_TICKS - 1, 0));
+        assert!(sink_never_delivered(SYS_SILENCE_CHECK_TICKS, 0));
+        assert!(!sink_never_delivered(SYS_SILENCE_CHECK_TICKS, 1));
+        assert!(!sink_never_delivered(SYS_SILENCE_CHECK_TICKS + 1, 0));
+        assert_eq!(SYS_SILENCE_CHECK_TICKS, 500, "5 s at 10 ms per tick");
     }
 
     #[test]

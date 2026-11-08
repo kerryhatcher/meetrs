@@ -5,13 +5,7 @@
 all-features = true
 
 [advisories]
-ignore = [
-    # unsafe-libyaml is unmaintained, and no safe upgrade exists. It is pulled in
-    # by serde_yaml_ng, which parses only the user's own ~/.meetrs/config.yaml.
-    # Input is local and trusted, so the risk is accepted here. Revisit when
-    # serde_yaml_ng moves off it.
-    { id = "RUSTSEC-2024-0449", reason = "config.yaml is a local, user-authored file; no safe upgrade exists" },
-]
+# No ignores. Every advisory in the graph is either fixed or absent.
 
 [licenses]
 # Every license present in the dependency graph today. Adding one is a

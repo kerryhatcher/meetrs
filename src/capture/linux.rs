@@ -84,6 +84,11 @@ static CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static SHAPE_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static EMPTY_CALLBACKS: AtomicU64 = AtomicU64::new(0);
 static LAST_N_DATAS: AtomicU64 = AtomicU64::new(0);
+/// The first failure a stream reports after startup, such as the device being
+/// unplugged. Startup failures fail `start()` instead. The other leg keeps
+/// recording, so the writer takes this once through `take_stream_fault` and
+/// reports it.
+static STREAM_FAULT: Mutex<Option<String>> = Mutex::new(None);
 
 /// Mirrors the macOS `IoStats`, with these meanings on PipeWire:
 /// - `calls`: process callbacks across both legs.
@@ -103,6 +108,24 @@ pub struct IoStats {
 
 pub fn dropped_samples() -> u64 {
     DROPPED_SAMPLES.load(Ordering::Relaxed)
+}
+
+/// The first stream failure since `start()`, returned once and then cleared.
+pub fn take_stream_fault() -> Option<String> {
+    STREAM_FAULT.lock().ok()?.take()
+}
+
+/// Keep the first post-startup failure. Later ones are usually the same device
+/// going away again, so they add nothing the writer can act on.
+fn record_fault(leg: &str, detail: &str) {
+    if let Ok(mut slot) = STREAM_FAULT.lock() {
+        slot.get_or_insert_with(|| {
+            format!(
+                "{leg} stream stopped ({detail}); recording continues without it. \
+                 Restart meetrs once the device is back."
+            )
+        });
+    }
 }
 
 pub fn io_stats() -> IoStats {
@@ -251,9 +274,24 @@ impl Startup {
         }
     }
 
+    /// An error before startup completes fails `start()`. After that it is a
+    /// runtime fault for the writer to report.
+    fn error(&self, leg: &str, detail: String) {
+        if self.ready.borrow().is_some() {
+            self.fail(format!("{leg} stream failed: {detail}"));
+        } else {
+            record_fault(leg, &detail);
+        }
+    }
+
     fn on_state(&self, leg: &str, bit: u8, state: &StreamState) {
         match state {
-            StreamState::Error(e) => self.fail(format!("{leg} stream failed: {e}")),
+            StreamState::Error(e) => self.error(leg, e.to_string()),
+            // Once a stream has streamed, dropping back to unconnected means
+            // PipeWire has lost its link, for example the device was unplugged.
+            StreamState::Unconnected if self.streaming.get() & bit != 0 => {
+                record_fault(leg, "PipeWire disconnected it");
+            }
             StreamState::Streaming => {
                 self.streaming.set(self.streaming.get() | bit);
                 if self.streaming.get() == MIC_STREAMING | SYS_STREAMING
@@ -594,6 +632,7 @@ pub fn start(ring_samples: usize) -> Result<(CaptureInfo, rtrb::Consumer<f32>)> 
         bail!("capture already started; call stop() first");
     }
 
+    *STREAM_FAULT.lock().unwrap() = None;
     let (out_prod, out_cons) = rtrb::RingBuffer::<f32>::new(ring_samples);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();
@@ -802,6 +841,18 @@ mod tests {
         let mut m = Mixer::new(mic, sys, out(64), TOL);
         assert_eq!(m.tick(), 0);
         assert!(m.out.samples.is_empty());
+    }
+
+    #[test]
+    fn the_first_runtime_fault_is_reported_once() {
+        // Only this test touches the slot, so the parallel test runner cannot race it.
+        let _ = take_stream_fault();
+        record_fault("system", "device gone");
+        record_fault("microphone", "later failure");
+        let msg = take_stream_fault().expect("a fault was recorded");
+        assert!(msg.starts_with("system stream stopped"), "{msg}");
+        assert!(msg.contains("device gone"), "{msg}");
+        assert!(take_stream_fault().is_none(), "reported twice");
     }
 
     #[test]

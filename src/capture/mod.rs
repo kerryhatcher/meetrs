@@ -15,10 +15,17 @@ pub use macos::IoStats;
 #[cfg(target_os = "macos")]
 pub use macos::{dropped_samples, io_stats, start, stop};
 
+/// macOS has no post-startup stream fault reporting yet. Its device loss shows
+/// up as silence in the leg's level meter instead.
+#[cfg(target_os = "macos")]
+pub fn take_stream_fault() -> Option<String> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 mod linux;
 #[cfg(not(target_os = "macos"))]
 #[allow(unused_imports)] // named only via io_stats()'s return type; kept as public API
 pub use linux::IoStats;
 #[cfg(not(target_os = "macos"))]
-pub use linux::{dropped_samples, io_stats, start, stop};
+pub use linux::{dropped_samples, io_stats, start, stop, take_stream_fault};

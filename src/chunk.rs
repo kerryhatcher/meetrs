@@ -816,6 +816,9 @@ fn finish_chunk(
 }
 
 fn check_overrun(tx: &Sender<Status>, last_dropped: &mut u64) {
+    if let Some(msg) = crate::capture::take_stream_fault() {
+        let _ = tx.send(Status::Warning(msg));
+    }
     let dropped = crate::capture::dropped_samples();
     if dropped > *last_dropped {
         let _ = tx.send(Status::Overrun {

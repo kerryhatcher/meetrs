@@ -648,10 +648,7 @@ mod tests {
             .unwrap();
 
         db.delete_session(&dir).unwrap();
-        assert!(
-            db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10)
-                .is_err()
-        );
+        assert!(db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10).is_err());
         db.delete_session(&dir).unwrap();
         let _ = std::fs::remove_file(&path);
     }

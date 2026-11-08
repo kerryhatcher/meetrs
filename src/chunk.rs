@@ -8,8 +8,7 @@
 
 use crate::types::{
     CaptureInfo, IDLE_ROLLOVER, Job, MIN_CHUNK, SILENCE_TO_CUT, Status, max_chunk, max_chunk_bytes,
-    next_midnight,
-    session_dir,
+    next_midnight, session_dir,
 };
 use crate::vad::Vad;
 use anyhow::Result;
@@ -83,8 +82,7 @@ impl Chunker {
         // frames is held back for the pre-roll and for the batch that crosses
         // the limit, so the file stays under `max_chunk_bytes`.
         let bytes_per_frame = channels.max(1) as u64 * 4;
-        let max_frames =
-            (max_chunk_bytes() / bytes_per_frame).saturating_sub(sample_rate as u64);
+        let max_frames = (max_chunk_bytes() / bytes_per_frame).saturating_sub(sample_rate as u64);
         Chunker {
             silence_to_cut: SILENCE_TO_CUT,
             max_chunk: max_chunk(),
@@ -695,11 +693,7 @@ fn record(
 /// discard audio; otherwise it is left for a human to look at.
 fn discard_empty_session(dir: &Path, db: Option<&mut crate::db::Db>, tx: &Sender<Status>) {
     let only_meta = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .all(|e| e.file_name() == "meta.json")
-        })
+        .map(|entries| entries.flatten().all(|e| e.file_name() == "meta.json"))
         .unwrap_or(false);
     if !only_meta {
         return;
@@ -962,11 +956,20 @@ mod tests {
         let dir = root.join("2026-10-20T00-00-00");
         let (tx, rx) = std::sync::mpsc::channel();
 
-        begin_session(&dir, chrono::Local::now(), &test_info(), 0.02, "earshot", Some(&mut db), &tx)
-            .unwrap();
+        begin_session(
+            &dir,
+            chrono::Local::now(),
+            &test_info(),
+            0.02,
+            "earshot",
+            Some(&mut db),
+            &tx,
+        )
+        .unwrap();
 
         // A closed chunk can only be recorded against a registered session.
-        db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10).unwrap();
+        db.record_chunk(&dir, 0, "chunk-000.wav", 1.0, 0.0, 10)
+            .unwrap();
         assert!(rx.try_recv().is_err(), "no warning expected");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -991,11 +994,19 @@ mod tests {
     }
 
     const fn speech(count: usize, at: chrono::DateTime<chrono::Local>) -> Script {
-        Script { count, loud: true, at }
+        Script {
+            count,
+            loud: true,
+            at,
+        }
     }
 
     const fn quiet(count: usize, at: chrono::DateTime<chrono::Local>) -> Script {
-        Script { count, loud: false, at }
+        Script {
+            count,
+            loud: false,
+            at,
+        }
     }
 
     /// Enough quiet batches that the chunker (2s of silence) closes the chunk.
@@ -1103,7 +1114,11 @@ mod tests {
         // The chunk open at midnight was closed into the first day.
         assert_eq!(r.summary.chunks, 2);
         for dir in &r.summary.sessions {
-            assert!(dir.join("meta.json").is_file(), "{} has no meta.json", dir.display());
+            assert!(
+                dir.join("meta.json").is_file(),
+                "{} has no meta.json",
+                dir.display()
+            );
         }
         let meta: serde_json::Value =
             serde_json::from_slice(&std::fs::read(day2.join("meta.json")).unwrap()).unwrap();
@@ -1112,7 +1127,8 @@ mod tests {
         // Both sessions were registered in the index.
         let mut db = crate::db::open_at(&db_path).unwrap();
         for dir in &r.summary.sessions {
-            db.record_chunk(dir, 99, "chunk-099.wav", 1.0, 0.0, 10).unwrap();
+            db.record_chunk(dir, 99, "chunk-099.wav", 1.0, 0.0, 10)
+                .unwrap();
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1128,7 +1144,11 @@ mod tests {
             quiet(1, local(16, 0, 5, 0)),
         ];
         let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
-        assert_eq!(r.summary.sessions, vec![root.join("day1")], "rolled with nobody talking");
+        assert_eq!(
+            r.summary.sessions,
+            vec![root.join("day1")],
+            "rolled with nobody talking"
+        );
 
         let script = [
             speech(KEPT, local(15, 23, 50, 0)),
@@ -1138,7 +1158,10 @@ mod tests {
         ];
         let (root, db_path) = fresh_root("midnight-quiet-2");
         let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
-        assert_eq!(r.summary.sessions, vec![root.join("day1"), root.join("day2")]);
+        assert_eq!(
+            r.summary.sessions,
+            vec![root.join("day1"), root.join("day2")]
+        );
         assert_eq!(r.started_at, vec![local(16, 0, 10, 0)]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1178,7 +1201,10 @@ mod tests {
         // The session is logged as starting when speech returned, not when the
         // quiet ended or the process did.
         assert_eq!(r.started_at, vec![local(15, 11, 0, 0)]);
-        assert_eq!(r.summary.sessions, vec![root.join("day1"), root.join("day2")]);
+        assert_eq!(
+            r.summary.sessions,
+            vec![root.join("day1"), root.join("day2")]
+        );
         let idle_at = r
             .statuses
             .iter()
@@ -1190,10 +1216,9 @@ mod tests {
             .position(|s| matches!(s, Status::SessionStarted { .. }))
             .expect("a new session started");
         assert!(idle_at < started_at);
-        let meta: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(root.join("day2").join("meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("day2").join("meta.json")).unwrap())
+                .unwrap();
         assert_eq!(meta["started"], local(15, 11, 0, 0).to_rfc3339());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1229,10 +1254,14 @@ mod tests {
         let r = record_script(&root, crate::db::open_at(&db_path).unwrap(), &script, false);
 
         assert_eq!(r.summary.sessions, vec![root.join("day2")]);
-        assert!(!root.join("day1").exists(), "empty session directory left behind");
+        assert!(
+            !root.join("day1").exists(),
+            "empty session directory left behind"
+        );
         let mut db = crate::db::open_at(&db_path).unwrap();
         assert!(
-            db.record_chunk(&root.join("day1"), 0, "chunk-000.wav", 1.0, 0.0, 10).is_err(),
+            db.record_chunk(&root.join("day1"), 0, "chunk-000.wav", 1.0, 0.0, 10)
+                .is_err(),
             "empty session still in the index"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1325,8 +1354,14 @@ mod size_cap_tests {
         }
         let frames = cut.expect("a long unbroken chunk must be cut");
         let bytes = frames * 3 * 4;
-        assert!(bytes <= max_chunk_bytes(), "{bytes} bytes is over the limit");
+        assert!(
+            bytes <= max_chunk_bytes(),
+            "{bytes} bytes is over the limit"
+        );
         // Not early either: the cut lands within a second of the budget.
-        assert!(bytes + 48_000 * 12 > max_chunk_bytes(), "cut too early at {bytes} bytes");
+        assert!(
+            bytes + 48_000 * 12 > max_chunk_bytes(),
+            "cut too early at {bytes} bytes"
+        );
     }
 }

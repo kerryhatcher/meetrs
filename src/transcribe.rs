@@ -346,7 +346,11 @@ struct SessionState {
 /// different directory than the last — the writer opens a new session at
 /// midnight, and jobs arrive in order, so the old one is finished for good.
 fn session_for<'a>(current: &'a mut Option<SessionState>, job: &Job) -> &'a mut SessionState {
-    let dir = job.path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    let dir = job
+        .path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
     if current.as_ref().is_none_or(|s| s.dir != dir) {
         *current = Some(SessionState {
             dir,
@@ -478,7 +482,9 @@ pub fn run(rx: Receiver<Job>, model: PathBuf, tx: Sender<Status>) -> Result<()> 
                         lines,
                     });
                 }
-                if let Err(e) = write_atomic(&dir.join("transcript.md"), state.transcript_md.as_bytes()) {
+                if let Err(e) =
+                    write_atomic(&dir.join("transcript.md"), state.transcript_md.as_bytes())
+                {
                     let _ = tx.send(Status::Warning(format!(
                         "transcript.md write failed after chunk {}: {e}",
                         job.index
@@ -885,7 +891,6 @@ mod tests {
             }
         }
     }
-
 
     /// Not run by `cargo test`. Times the same `transcribe_leg` path the worker
     /// uses on a clip the caller supplies, transcribing it as both legs the way
